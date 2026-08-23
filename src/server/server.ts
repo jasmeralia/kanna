@@ -250,6 +250,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const usageLimits = new UsageLimitsManager(path.join(store.dataDir, "usage-limits.json"), {
     fetchClaudeUsage: () => agent.fetchClaudeUsage(),
     fetchCodexRateLimits: () => agent.fetchCodexRateLimits(),
+    fetchCursorUsage: () => agent.fetchCursorUsage(),
   })
   await usageLimits.initialize()
   agent.setClaudeRateLimitListener((info) => usageLimits.recordClaudeRateLimitPush(info))
