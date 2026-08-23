@@ -459,7 +459,7 @@ export function GeneralSection({
 
         <SettingsRow
           def={SETTINGS_ROWS.usageLimitIndicators}
-          description="Show plan-limit rings next to the chat input's context meter. Claude Code shows its 5-hour and weekly windows; Codex shows its weekly window. Full details stay on the Usage page."
+          description="Show plan-limit rings next to the chat input's context meter. Claude Code shows its 5-hour and weekly windows; Codex shows its weekly window; Cursor shows Cursor Models and Other Models. Full details stay on the Usage page."
         >
           <SegmentedControl
             value={usageLimitIndicatorsValue}
