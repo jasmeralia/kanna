@@ -328,6 +328,8 @@ describe("normalizeCursorUsageLimits", () => {
       label: "Cursor Models",
       usedPercent: 10.96,
       resetsAt: CURSOR_RESETS_AT,
+      windowMinutes: null,
+      modelLabel: null,
       recordedAt: NOW,
       source: "on_demand",
     })
@@ -335,6 +337,8 @@ describe("normalizeCursorUsageLimits", () => {
       label: "Other Models",
       usedPercent: 37.644444444444446,
       resetsAt: CURSOR_RESETS_AT,
+      windowMinutes: null,
+      modelLabel: null,
     })
     expect(snapshot.credits).toBeNull()
     expect(snapshot.updatedAt).toBe(NOW)
