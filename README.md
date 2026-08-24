@@ -52,6 +52,7 @@ That's it. Kanna opens in your browser at [`localhost:3210`](http://localhost:32
 - **Drag-and-drop project ordering** — reorder project groups in the sidebar with persistent ordering
 - **Local project discovery** — auto-discovers projects from both Claude and Codex local history
 - **Rich transcript rendering** — hydrated tool calls, collapsible tool groups, plan mode dialogs, and interactive prompts with full result display
+- **File attachments** — attach, paste, or drag up to 50 files per message (100 MB each), with the attachment control available at every viewport size
 - **Quick responses** — lightweight structured queries (e.g. title generation) via Haiku with automatic Codex fallback
 - **Plan mode** — review and approve agent plans before execution
 - **Persistent local history** — refresh-safe routes backed by JSONL event logs and compacted snapshots

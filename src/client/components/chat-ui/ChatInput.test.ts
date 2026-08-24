@@ -124,7 +124,7 @@ describe("trimTrailingPastedNewlines", () => {
 })
 
 describe("ChatInput", () => {
-  test("renders the mobile attachment trigger as a native file input target in the controls row", () => {
+  test("renders one shared file picker and an attachment trigger without breakpoint hiding", () => {
     const html = renderToStaticMarkup(createElement(
       MemoryRouter,
       null,
@@ -141,10 +141,15 @@ describe("ChatInput", () => {
       ),
     ))
 
-    expect(html).toContain('aria-label="Add attachment"')
-    expect(html).toContain('type="file"')
-    expect(html).toContain("absolute inset-0 h-full w-full cursor-pointer opacity-0")
-    expect(html.indexOf('aria-label="Add attachment"')).toBeGreaterThan(html.indexOf('placeholder="Build something..."'))
-    expect(html).not.toContain('type="file" multiple="" class="hidden"')
+    const triggerLabelIndex = html.indexOf('aria-label="Add attachment"')
+    const triggerStartIndex = html.lastIndexOf("<button", triggerLabelIndex)
+    const triggerEndIndex = html.indexOf("</button>", triggerLabelIndex)
+    const triggerHtml = html.slice(triggerStartIndex, triggerEndIndex)
+
+    expect(html.match(/type="file"/gu)).toHaveLength(1)
+    expect(html).toContain('type="file" multiple="" aria-hidden="true" tabindex="-1" class="hidden"')
+    expect(triggerLabelIndex).toBeGreaterThan(html.indexOf('placeholder="Build something..."'))
+    expect(triggerHtml).toContain("Attach")
+    expect(triggerHtml).not.toContain("md:hidden")
   })
 })

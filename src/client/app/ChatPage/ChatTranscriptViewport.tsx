@@ -50,6 +50,7 @@ import {
 } from "./utils"
 import type { EditorOpenSettings, EditorPreset, OpenExternalAction, TerminalPreset } from "../../../shared/protocol"
 import type { TranscriptOutlineEntry } from "../../../shared/types"
+import { MAX_ATTACHMENT_FILES } from "../../../shared/attachments"
 /**
  * How close to the bottom counts as "at the end", as a fraction of viewport
  * height.
@@ -1226,7 +1227,7 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
             <div className="flex h-full items-center justify-center">
               <div className="flex flex-col items-center justify-center gap-3 text-center">
                 <Upload className="mx-auto size-14 text-foreground" strokeWidth={1.75} />
-                <div className="text-xl font-medium text-foreground">Drop up to 10 files</div>
+                <div className="text-xl font-medium text-foreground">Drop up to {MAX_ATTACHMENT_FILES} files</div>
               </div>
             </div>
           </div>
