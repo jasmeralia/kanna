@@ -11,6 +11,7 @@ import {
   type ProviderCatalogEntry,
   resolveClaudeContextWindowMaxTokens,
 } from "../../../shared/types"
+import { MAX_ATTACHMENT_FILES } from "../../../shared/attachments"
 import { Button } from "../ui/button"
 import { Textarea } from "../ui/textarea"
 import { ScrollArea } from "../ui/scroll-area"
@@ -43,7 +44,6 @@ import {
   getActiveSlashQuery,
 } from "../../lib/skill-menu"
 
-const MAX_FILES_PER_DROP = 50
 const MAX_CONCURRENT_UPLOADS = 3
 
 const CLIPBOARD_EXTENSION_BY_MIME_TYPE: Record<string, string> = {
@@ -59,7 +59,7 @@ export function willExceedAttachmentLimit(args: {
   incomingAttachmentCount: number
   maxAttachments?: number
 }) {
-  const maxAttachments = args.maxAttachments ?? MAX_FILES_PER_DROP
+  const maxAttachments = args.maxAttachments ?? MAX_ATTACHMENT_FILES
   return args.currentAttachmentCount + args.queuedAttachmentCount + args.incomingAttachmentCount > maxAttachments
 }
 
@@ -270,7 +270,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const uploadQueueRef = useRef<File[]>([])
   const activeUploadsRef = useRef(0)
   const attachmentsRef = useRef<ComposerAttachment[]>([])
-  const paletteFileInputRef = useRef<HTMLInputElement | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const uploadGenerationRef = useRef(0)
   const removedAttachmentIdsRef = useRef<Set<string>>(new Set())
   const previousProjectIdRef = useRef<string | null>(projectId ?? null)
@@ -662,7 +662,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       queuedAttachmentCount: uploadQueueRef.current.length,
       incomingAttachmentCount: files.length,
     })) {
-      setUploadError(simpleUploadError(`You can upload up to ${MAX_FILES_PER_DROP} files at a time.`))
+      setUploadError(simpleUploadError(`You can upload up to ${MAX_ATTACHMENT_FILES} files at a time.`))
       return
     }
 
@@ -675,10 +675,10 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     enqueueFiles,
   }), [enqueueFiles])
 
-  // The command palette's "Attach Files" action opens the hidden picker.
+  // The visible control and command palette action share one hidden picker.
   useEffect(() => {
     function handleAttachRequest() {
-      paletteFileInputRef.current?.click()
+      fileInputRef.current?.click()
     }
 
     window.addEventListener(REQUEST_ATTACH_FILES_EVENT, handleAttachRequest)
@@ -1087,9 +1087,9 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
         {uploadError ? <UploadErrorNotice report={uploadError} /> : null}
       </div>
 
-      {/* Hidden picker for the command palette's "Attach Files" action. */}
+      {/* Shared picker for the visible control and command palette action. */}
       <input
-        ref={paletteFileInputRef}
+        ref={fileInputRef}
         type="file"
         multiple
         disabled={disabled}
@@ -1115,31 +1115,20 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       <div className={cn("relative py-3 max-w-[840px] mx-auto", isStandalone && "pt-3 pb-5")}>
         <div className="overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden flex flex-row">
           <div className={controlsScrollSpacer} />
-          <label
+          <button
+            type="button"
             aria-label="Add attachment"
+            disabled={disabled}
+            onClick={() => fileInputRef.current?.click()}
             className={cn(
-              "relative md:hidden shrink-0 self-center overflow-hidden mr-0.5 cursor-pointer",
+              "shrink-0 self-center mr-0.5 cursor-pointer",
               "flex items-center gap-1.5 px-2 py-1 text-sm rounded-md transition-colors text-muted-foreground [&>svg]:shrink-0 [&>span]:whitespace-nowrap hover:bg-muted/50",
-              disabled && "pointer-events-none opacity-70",
+              disabled && "cursor-default opacity-70",
             )}
           >
             <Paperclip className="h-3.5 w-3.5" />
             <span>Attach</span>
-            <input
-              type="file"
-              multiple
-              disabled={disabled}
-              aria-label="Add attachment"
-              className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-              onChange={(event) => {
-                const files = [...(event.target.files ?? [])]
-                if (files.length > 0) {
-                  enqueueFiles(files)
-                }
-                event.target.value = ""
-              }}
-            />
-          </label>
+          </button>
           <ChatPreferenceControls
             availableProviders={availableProviders}
             selectedProvider={selectedProvider}
