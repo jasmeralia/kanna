@@ -1,6 +1,11 @@
 import path from "node:path"
 import { stat } from "node:fs/promises"
 import { APP_NAME, getRuntimeProfile, LOG_PREFIX } from "../shared/branding"
+import {
+  MAX_ATTACHMENT_FILES,
+  MAX_ATTACHMENT_SIZE_BYTES,
+  MAX_ATTACHMENT_SIZE_MEGABYTES,
+} from "../shared/attachments"
 import type { ChatAttachment } from "../shared/types"
 import type { ShareMode } from "../shared/share"
 import {
@@ -41,8 +46,6 @@ import { instanceFingerprint } from "./instance"
 import { deleteProjectUpload, inferAttachmentContentType, inferProjectFileContentType, persistProjectUpload } from "./uploads"
 import { getProjectUploadDir } from "./paths"
 
-const MAX_UPLOAD_FILES = 50
-const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024
 const STALE_EMPTY_CHAT_PRUNE_INTERVAL_MS = 60 * 1000
 const STALE_CHAT_AUTO_ARCHIVE_INTERVAL_MS = 6 * 60 * 60 * 1000
 const STALE_CHAT_DELETE_INTERVAL_MS = 24 * 60 * 60 * 1000
@@ -707,14 +710,14 @@ async function handleProjectUpload(req: Request, url: URL, store: EventStore) {
     }
   }
 
-  if (files.length > MAX_UPLOAD_FILES) {
-    return Response.json({ error: `You can upload up to ${MAX_UPLOAD_FILES} files at a time.` }, { status: 400 })
+  if (files.length > MAX_ATTACHMENT_FILES) {
+    return Response.json({ error: `You can upload up to ${MAX_ATTACHMENT_FILES} files at a time.` }, { status: 400 })
   }
 
   for (const file of files) {
-    if (file.size > MAX_UPLOAD_SIZE_BYTES) {
+    if (file.size > MAX_ATTACHMENT_SIZE_BYTES) {
       return Response.json(
-        { error: `File "${file.name}" exceeds the ${Math.floor(MAX_UPLOAD_SIZE_BYTES / (1024 * 1024))} MB limit.` },
+        { error: `File "${file.name}" exceeds the ${MAX_ATTACHMENT_SIZE_MEGABYTES} MB limit.` },
         { status: 413 }
       )
     }
