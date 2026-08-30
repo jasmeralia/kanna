@@ -49,8 +49,20 @@ function createServerProviders(): ProviderCatalogEntry[] {
 
 export const SERVER_PROVIDERS: ProviderCatalogEntry[] = createServerProviders()
 
+/** Bumped whenever a runtime catalog overlay changes; ws-router uses it to re-push provider lists. */
+let providerCatalogGeneration = 0
+
+export function getProviderCatalogGeneration(): number {
+  return providerCatalogGeneration
+}
+
+function bumpProviderCatalogGeneration(): void {
+  providerCatalogGeneration += 1
+}
+
 export function resetServerProvidersForTests() {
   SERVER_PROVIDERS.splice(0, SERVER_PROVIDERS.length, ...createServerProviders())
+  providerCatalogGeneration = 0
 }
 
 /**
@@ -129,6 +141,7 @@ export function applyClaudeSdkModels(models: readonly ClaudeSdkModelInfo[]) {
     defaultModel,
     models: nextModels,
   })
+  bumpProviderCatalogGeneration()
   return true
 }
 
@@ -161,6 +174,7 @@ export function applyPiFaveModels(faveModels: ReadonlyArray<FaveModel>): boolean
     defaultModel: nextProvider.defaultModel,
     models: structuredClone(nextProvider.models),
   })
+  bumpProviderCatalogGeneration()
   return true
 }
 
@@ -327,6 +341,7 @@ export function applyCursorModels(models: ReadonlyArray<CursorCliModelInfo>): bo
     defaultModel,
     models: nextModels,
   })
+  bumpProviderCatalogGeneration()
   return true
 }
 
