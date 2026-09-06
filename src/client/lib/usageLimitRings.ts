@@ -109,7 +109,13 @@ export function selectLimitRingWindows(
     }
   }
   if (provider === "codex") {
-    return { snapshot: providerSnapshot, slots: [weekly] }
+    return {
+      snapshot: providerSnapshot,
+      slots: [
+        { key: "session", label: "5-hour limit", window: selectSessionWindow(windows), alsoApplies: null },
+        weekly,
+      ],
+    }
   }
   if (provider === "cursor") {
     return {
