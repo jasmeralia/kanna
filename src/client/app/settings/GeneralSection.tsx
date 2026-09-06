@@ -478,7 +478,7 @@ export function GeneralSection({
           <SettingsRow
             def={SETTINGS_ROWS.usageLimitIndicators}
             inlineControl
-            description="Show plan-limit rings next to the chat input's context meter. Claude Code shows its 5-hour and weekly windows; Codex shows its weekly window. Full details stay on the Usage page."
+            description="Show plan-limit rings next to the chat input's context meter. Claude Code and Codex each show 5-hour and weekly windows. Full details stay on the Usage page."
           >
             <Switch
               checked={usageLimitIndicatorsEnabled}
