@@ -360,7 +360,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const uploadQueueRef = useRef<File[]>([])
   const activeUploadsRef = useRef(0)
   const attachmentsRef = useRef<ComposerAttachment[]>([])
-  const paletteFileInputRef = useRef<HTMLInputElement | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const uploadGenerationRef = useRef(0)
   const removedAttachmentIdsRef = useRef<Set<string>>(new Set())
   const previousProjectIdRef = useRef<string | null>(projectId ?? null)
@@ -940,11 +940,11 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     prefill,
   }), [enqueueFiles, prefill])
 
-  // The command palette's "Attach Files" action opens the hidden picker.
+  // The command palette shares the native picker with the composer attachment control.
   useEffect(() => {
     if (secondary) return
     function handleAttachRequest() {
-      paletteFileInputRef.current?.click()
+      fileInputRef.current?.click()
     }
 
     window.addEventListener(REQUEST_ATTACH_FILES_EVENT, handleAttachRequest)
@@ -1293,6 +1293,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   {/* A real file input under the glyph, not a click forwarded to a
                       hidden one: iOS Safari only opens its picker for a tap on the input. */}
                   <input
+                    ref={fileInputRef}
                     type="file"
                     multiple
                     disabled={disabled || inert}
@@ -1671,24 +1672,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
 
         {uploadError ? <UploadErrorNotice report={uploadError} /> : null}
       </div>
-
-      {/* Hidden picker for the command palette's "Attach Files" action. */}
-      <input
-        ref={paletteFileInputRef}
-        type="file"
-        multiple
-        disabled={disabled}
-        aria-hidden="true"
-        tabIndex={-1}
-        className="hidden"
-        onChange={(event) => {
-          const files = [...(event.target.files ?? [])]
-          if (files.length > 0) {
-            enqueueFiles(files)
-          }
-          event.target.value = ""
-        }}
-      />
 
       <SignInDialog
         provider={pendingSignInProvider}
