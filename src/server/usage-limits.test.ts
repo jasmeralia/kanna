@@ -361,6 +361,30 @@ describe("normalizeCursorUsageLimits", () => {
     expect(normalizeCursorUsageLimits({ planInfo: { planInfo: { planName: "Pro" } } }, NOW).status)
       .toBe("unavailable")
   })
+
+  // Team/pooled accounts report their shared cap in `pooledLimit` with
+  // `individualLimit` unset — best-effort mapping, see the comment in
+  // normalizeCursorUsageLimits. We don't have a real pooled-account fixture
+  // to confirm `individualUsed` is the right numerator against it.
+  test("falls back to the pooled limit when there is no individual cap", () => {
+    const raw: CursorUsageRaw = {
+      currentPeriodUsage: {
+        planUsage: {},
+        spendLimitUsage: { limitType: "pooled", individualUsed: 500, pooledLimit: 10_000 },
+        enabled: true,
+      },
+      planInfo: null,
+      hardLimit: null,
+    }
+
+    const snapshot = normalizeCursorUsageLimits(raw, NOW)
+
+    expect(snapshot.credits).toMatchObject({
+      usedAmount: 5,
+      limitAmount: 100,
+      usedPercent: 5,
+    })
+  })
 })
 
 describe("mergeCodexRateLimitPush", () => {
