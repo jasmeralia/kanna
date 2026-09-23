@@ -1210,7 +1210,7 @@ const TranscriptScrollerBody = memo(function TranscriptScrollerBody({
               >
                 <div className="w-full space-y-3">
                   <EmptyStateAuthCards />
-                  <EmptyStateUsageCards socket={socket} activeChatId={activeChatId} />
+                  <EmptyStateUsageCards activeChatId={activeChatId} />
                 </div>
               </div>
             ) : null}

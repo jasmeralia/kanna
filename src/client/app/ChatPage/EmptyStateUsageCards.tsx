@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useState } from "react"
-import type { UsageLimitsSnapshot } from "../../../shared/types"
+import { useMemo } from "react"
 import { NEW_CHAT_COMPOSER_ID, useChatPreferencesStore } from "../../stores/chatPreferencesStore"
-import type { KannaSocket } from "../socket"
+import { useUsageLimitsSnapshot } from "../../stores/usageLimitsStore"
 import { ProviderCard } from "../settings/UsageSection"
 
 /**
@@ -10,19 +9,18 @@ import { ProviderCard } from "../settings/UsageSection"
  * subscription). Cards start collapsed — each header carries its first window's
  * meter — with the composer's current provider listed first. Display-only —
  * refresh lives on the Settings → Usage page.
+ *
+ * Shares the composer rings' subscription (`useUsageLimitsSnapshot`) rather
+ * than opening its own — both mount together on the empty-chat page, and a
+ * second direct `usage-limits` subscribe would make the server kick a second
+ * redundant provider read.
  */
 export function EmptyStateUsageCards({
-  socket,
   activeChatId,
 }: {
-  socket: KannaSocket
   activeChatId: string | null
 }) {
-  const [snapshot, setSnapshot] = useState<UsageLimitsSnapshot | null>(null)
-
-  useEffect(() => {
-    return socket.subscribe<UsageLimitsSnapshot>({ type: "usage-limits" }, setSnapshot)
-  }, [socket])
+  const snapshot = useUsageLimitsSnapshot(true)
 
   // The composer provider currently chosen for this (new/empty) chat.
   const composerChatId = activeChatId ?? NEW_CHAT_COMPOSER_ID
