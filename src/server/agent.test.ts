@@ -1397,6 +1397,151 @@ describe("AgentCoordinator codex integration", () => {
   })
 })
 
+// Regression coverage for Odoo task #557: a failed durable write inside
+// cancel() used to leave cancelRequested latched forever, since
+// activeTurns.delete only ran on the success path.
+describe("AgentCoordinator cancel resilience", () => {
+  function fakeCodexManagerWithHangingStream() {
+    return {
+      async startSession() {},
+      async startTurn(): Promise<HarnessTurn> {
+        async function* stream() {
+          yield {
+            type: "transcript" as const,
+            entry: timestamped({
+              kind: "system_init",
+              provider: "codex",
+              model: "gpt-5.4",
+              tools: [],
+              agents: [],
+              slashCommands: [],
+              mcpServers: [],
+            }),
+          }
+          // Never resolves — the turn just sits there, same as a real stuck run.
+          await new Promise(() => {})
+        }
+        return {
+          provider: "codex",
+          stream: stream(),
+          interrupt: async () => {},
+          close: () => {},
+        }
+      },
+    }
+  }
+
+  // cancel() still rethrows the original store-write failure after its
+  // finally block releases the chat — that's fine, callers already treat
+  // cancel() as best-effort. What matters for these tests is the state
+  // afterwards, which the assertions below check.
+  async function pressStopIgnoringRejection(coordinator: AgentCoordinator, chatId: string) {
+    try {
+      await coordinator.cancel(chatId)
+    } catch {
+      // The failed store write propagates out of cancel() by design.
+    }
+  }
+
+  test("a rejecting recordTurnCancelled still releases the chat instead of wedging it", async () => {
+    const store = createFakeStore()
+    store.recordTurnCancelled = async () => {
+      throw new Error("simulated disk-full store write failure")
+    }
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: fakeCodexManagerWithHangingStream() as never,
+    })
+
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "do something" })
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === "running")
+
+    // First stop press: the store write fails partway through cancel().
+    await pressStopIgnoringRejection(coordinator, "chat-1")
+
+    // Acceptance criterion: the turn is removed from activeTurns and the
+    // chat reports idle, even though the durable write failed. Today it
+    // doesn't — this is the assertion that should flip red -> green.
+    expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+
+    // Second stop press, in case the first left `cancelRequested` latched:
+    // acceptance criterion says a second cancel() on a latched turn must
+    // force-clear it rather than being a permanent no-op.
+    await pressStopIgnoringRejection(coordinator, "chat-1")
+    expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+
+    // Acceptance criterion: a new message can be started immediately
+    // afterwards — not silently queued forever behind a wedged turn.
+    const result = await coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "codex", content: "are you there?",
+    })
+    expect(result).not.toMatchObject({ queued: true })
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === "running")
+    expect(store.queuedMessages).toHaveLength(0)
+  })
+
+  test("a rejecting appendMessage (the 'interrupted' entry) still releases the chat instead of wedging it", async () => {
+    const store = createFakeStore()
+    const realAppendMessage = store.appendMessage.bind(store)
+    store.appendMessage = async (chatId: string, entry: TranscriptEntry) => {
+      // Only fail the write cancel() itself makes; unrelated appends during
+      // normal turn processing (system_init, the user_prompt, ...) succeed.
+      if (entry.kind === "interrupted") throw new Error("simulated store write failure")
+      return realAppendMessage(chatId, entry)
+    }
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: fakeCodexManagerWithHangingStream() as never,
+    })
+
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "do something" })
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === "running")
+
+    await pressStopIgnoringRejection(coordinator, "chat-1")
+    expect(coordinator.getActiveStatuses().has("chat-1")).toBe(false)
+
+    const result = await coordinator.send({
+      type: "chat.send", chatId: "chat-1", provider: "codex", content: "are you there?",
+    })
+    expect(result).not.toMatchObject({ queued: true })
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === "running")
+  })
+
+  test("a genuine concurrent double cancel still records the turn cancelled exactly once", async () => {
+    const store = createFakeStore()
+    let recordTurnCancelledCalls = 0
+    const realRecordTurnCancelled = store.recordTurnCancelled.bind(store)
+    store.recordTurnCancelled = async (chatId: string) => {
+      recordTurnCancelledCalls += 1
+      return realRecordTurnCancelled(chatId)
+    }
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: fakeCodexManagerWithHangingStream() as never,
+    })
+
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "do something" })
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === "running")
+
+    // Three stop presses arriving before any of them settle — the guard this
+    // recoverable path must not regress.
+    await Promise.all([
+      coordinator.cancel("chat-1"),
+      coordinator.cancel("chat-1"),
+      coordinator.cancel("chat-1"),
+    ])
+
+    expect(store.messages.filter((entry) => entry.kind === "interrupted")).toHaveLength(1)
+    expect(recordTurnCancelledCalls).toBe(1)
+  })
+})
+
 describe("AgentCoordinator claude integration", () => {
   test("tracks analytics for new chats, queued messages, and forks", async () => {
     const events = new AsyncEventQueue<any>()
@@ -2545,6 +2690,65 @@ describe("AgentCoordinator restart resume", () => {
     expect(store.messages.some((entry) => entry.kind === "interrupted")).toBe(true)
   })
 
+  test("shutdown continues past a rejecting cancel and still cancels the remaining chat", async () => {
+    const store = createFakeStore({
+      chats: [
+        createFakeChat("chat-1", "project-1"),
+        createFakeChat("chat-2", "project-1"),
+      ],
+      projects: [{ id: "project-1", localPath: "/tmp/project" }],
+    })
+    store.recordTurnCancelled = async (chatId: string) => {
+      if (chatId === "chat-1") throw new Error("simulated disk-full store write failure")
+    }
+
+    const fakeCodexManager = {
+      async startSession() {},
+      async startTurn(): Promise<HarnessTurn> {
+        async function* stream() {
+          yield {
+            type: "transcript" as const,
+            entry: timestamped({
+              kind: "system_init",
+              provider: "codex",
+              model: "gpt-5.4",
+              tools: [],
+              agents: [],
+              slashCommands: [],
+              mcpServers: [],
+            }),
+          }
+          // Never resolves — same as a real stuck run.
+          await new Promise(() => {})
+        }
+        return {
+          provider: "codex",
+          stream: stream(),
+          interrupt: async () => {},
+          close: () => {},
+        }
+      },
+    }
+
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      codexManager: fakeCodexManager as never,
+    })
+
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "codex", content: "task one" })
+    await coordinator.send({ type: "chat.send", chatId: "chat-2", provider: "codex", content: "task two" })
+    await waitFor(() => coordinator.activeTurns.has("chat-1") && coordinator.activeTurns.has("chat-2"))
+
+    // chat-1's cancel() rejects partway through; shutdown must not stop
+    // there — chat-2 still needs to be cancelled and marked resumable.
+    await coordinator.interruptForShutdown()
+
+    expect(coordinator.activeTurns.size).toBe(0)
+    expect(store.getChat("chat-1")?.resumePending).toBe(true)
+    expect(store.getChat("chat-2")?.resumePending).toBe(true)
+  })
+
   test("shutdown does not mark a chat that is waiting on the user", async () => {
     let releaseInterrupt!: () => void
     const interrupted = new Promise<void>((resolve) => {
@@ -2772,7 +2976,7 @@ function createFakeStore(options?: {
     async recordTurnFailed() {
       throw new Error("Did not expect turn failure")
     },
-    async recordTurnCancelled() {},
+    async recordTurnCancelled(_chatId: string) {},
     async setTurnResumePending(chatId: string, pending: boolean) {
       const target = requireChat(chatId)
       if (pending) {

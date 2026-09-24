@@ -71,6 +71,7 @@ describe("parseLocalFileLink", () => {
         },
       },
       configurable: true,
+      writable: true,
     })
 
     try {
@@ -83,6 +84,7 @@ describe("parseLocalFileLink", () => {
       Object.defineProperty(globalThis, "window", {
         value: originalWindow,
         configurable: true,
+        writable: true,
       })
     }
   })

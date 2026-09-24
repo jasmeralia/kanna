@@ -160,6 +160,16 @@ interface ActiveTurn {
   hasFinalResult: boolean
   cancelRequested: boolean
   cancelRecorded: boolean
+  /**
+   * Set for the duration of the one cancel() call doing the actual work —
+   * distinct from cancelRequested, which just means "this turn is going
+   * away" and stays true forever once set. A second cancel() that finds
+   * cancelRequested set but cancelInFlight false knows the first cancel
+   * died partway through (a rejected store write) rather than being
+   * legitimately still in progress, and force-clears the turn instead of
+   * treating it as a no-op.
+   */
+  cancelInFlight: boolean
 }
 
 interface ClaudeSessionHandle {
@@ -1628,6 +1638,7 @@ export class AgentCoordinator {
       hasFinalResult: false,
       cancelRequested: false,
       cancelRecorded: false,
+      cancelInFlight: false,
     }
     this.activeTurns.set(args.chatId, active)
     markToolsReady()
@@ -2017,7 +2028,13 @@ export class AgentCoordinator {
           // Best effort — a chat we can't mark still gets cancelled cleanly.
         }
       }
-      await this.cancel(chatId)
+      try {
+        await this.cancel(chatId)
+      } catch {
+        // cancel() still releases the chat from its own finally block even
+        // when this rejects — don't let one bad chat stop the rest of
+        // shutdown from cancelling and marking themselves resumable.
+      }
     }
   }
 
@@ -2117,6 +2134,7 @@ export class AgentCoordinator {
       hasFinalResult: false,
       cancelRequested: false,
       cancelRecorded: false,
+      cancelInFlight: false,
     }
     this.activeTurns.set(session.chatId, active)
     await this.store.recordTurnStarted(session.chatId, session.model)
@@ -2434,9 +2452,21 @@ export class AgentCoordinator {
       activePromptSeq: active.claudePromptSeq ?? null,
     })
 
-    // Guard against concurrent cancel() calls — only the first one does work.
-    if (active.cancelRequested) return
+    if (active.cancelRequested) {
+      // A concurrent cancel() is already doing the work — let it finish,
+      // same as before.
+      if (active.cancelInFlight) return
+      // cancelRequested is set but nothing is currently in flight: a
+      // previous cancel() latched this turn and then died partway through
+      // (a rejected store write). Nothing else will ever clear it, so this
+      // second press forces the chat back to usable instead of requiring a
+      // restart. The durable writes already failed once (or never ran);
+      // skip them and only release the in-memory state.
+      await this.releaseActiveTurn(chatId, active)
+      return
+    }
     active.cancelRequested = true
+    active.cancelInFlight = true
 
     // Keep in-flight stream entries (emitted before the interrupt lands)
     // from re-registering an active turn via resumeBackgroundTurn, and mark
@@ -2455,26 +2485,42 @@ export class AgentCoordinator {
     active.pendingTool = null
     active.customTools?.abort()
 
-    if (pendingTool && pendingTool.resultOwner !== "tool") {
-      const result = discardedToolResult(pendingTool.tool)
-      await this.store.appendMessage(
-        chatId,
-        timestamped({
-          kind: "tool_result",
-          toolId: pendingTool.toolUseId,
-          content: result,
-        })
-      )
-      if (active.provider === "codex" && pendingTool.tool.toolKind === "exit_plan_mode") {
-        pendingTool.resolve(result)
+    try {
+      if (pendingTool && pendingTool.resultOwner !== "tool") {
+        const result = discardedToolResult(pendingTool.tool)
+        await this.store.appendMessage(
+          chatId,
+          timestamped({
+            kind: "tool_result",
+            toolId: pendingTool.toolUseId,
+            content: result,
+          })
+        )
+        if (active.provider === "codex" && pendingTool.tool.toolKind === "exit_plan_mode") {
+          pendingTool.resolve(result)
+        }
       }
+
+      await this.store.appendMessage(chatId, timestamped({ kind: "interrupted", hidden: options?.hideInterrupted }))
+      await this.store.recordTurnCancelled(chatId)
+      active.cancelRecorded = true
+      active.hasFinalResult = true
+    } finally {
+      // Unconditional: a failed durable write above must not leave the chat
+      // wedged. If recordTurnCancelled didn't run, cancelRecorded stays
+      // false and runTurn()'s own finally block retries it once the
+      // underlying stream actually settles — logged there, not swallowed.
+      active.cancelInFlight = false
+      await this.releaseActiveTurn(chatId, active)
     }
+  }
 
-    await this.store.appendMessage(chatId, timestamped({ kind: "interrupted", hidden: options?.hideInterrupted }))
-    await this.store.recordTurnCancelled(chatId)
-    active.cancelRecorded = true
-    active.hasFinalResult = true
-
+  /**
+   * Unconditionally drop a turn from active state and best-effort interrupt
+   * its underlying stream. Called from the end of a normal cancel() and from
+   * the force-clear path for a cancel that got wedged on a previous attempt.
+   */
+  private async releaseActiveTurn(chatId: string, active: ActiveTurn) {
     // Remove from activeTurns immediately so the UI reflects the cancellation
     // right away, rather than waiting for interrupt() which may hang.
     this.activeTurns.delete(chatId)
