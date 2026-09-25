@@ -9,6 +9,8 @@ import {
   normalizeClaudeUsage,
   normalizeCodexRateLimits,
   normalizeGrokAccountUsage,
+  normalizeCursorUsageLimits,
+  type CursorUsageRaw,
 } from "./usage-limits"
 
 const NOW = "2026-07-22T10:00:00.000Z"
@@ -309,6 +311,75 @@ describe("normalizeCodexRateLimits", () => {
   })
 })
 
+describe("normalizeCursorUsageLimits", () => {
+  test("maps Cursor Models / Other Models windows from a Pro account fixture", () => {
+    const snapshot = normalizeCursorUsageLimits(loadCursorFixture("cursor-usage-pro.json"), NOW)
+
+    expect(snapshot.status).toBe("ok")
+    expect(snapshot.plan).toBe("Pro")
+    expect(snapshot.windows.map((w) => w.id)).toEqual(["cursor_models", "other_models"])
+    expect(snapshot.windows[0]).toMatchObject({
+      label: "Cursor Models",
+      usedPercent: 10.96,
+      resetsAt: CURSOR_RESETS_AT,
+      windowMinutes: null,
+      modelLabel: null,
+      recordedAt: NOW,
+      source: "on_demand",
+    })
+    expect(snapshot.windows[1]).toMatchObject({
+      label: "Other Models",
+      usedPercent: 37.644444444444446,
+      resetsAt: CURSOR_RESETS_AT,
+      windowMinutes: null,
+      modelLabel: null,
+    })
+    expect(snapshot.credits).toBeNull()
+    expect(snapshot.updatedAt).toBe(NOW)
+  })
+
+  test("renders on-demand spend when the account has an individual cap", () => {
+    const snapshot = normalizeCursorUsageLimits(loadCursorFixture("cursor-usage-ondemand.json"), NOW)
+
+    expect(snapshot.credits).toMatchObject({
+      label: "On-demand",
+      usedAmount: 12.5,
+      limitAmount: 50,
+      usedPercent: 25,
+      currency: "USD",
+    })
+  })
+
+  test("missing usage payload is unavailable", () => {
+    expect(normalizeCursorUsageLimits(null, NOW).status).toBe("unavailable")
+    expect(normalizeCursorUsageLimits({ planInfo: { planInfo: { planName: "Pro" } } }, NOW).status)
+      .toBe("unavailable")
+  })
+
+  // Team/pooled accounts report their shared cap in `pooledLimit` with
+  // `individualLimit` unset — best-effort mapping, see the comment in
+  // normalizeCursorUsageLimits. We don't have a real pooled-account fixture
+  // to confirm `individualUsed` is the right numerator against it.
+  test("falls back to the pooled limit when there is no individual cap", () => {
+    const raw: CursorUsageRaw = {
+      currentPeriodUsage: {
+        planUsage: {},
+        spendLimitUsage: { limitType: "pooled", individualUsed: 500, pooledLimit: 10_000 },
+        enabled: true,
+      },
+      planInfo: null,
+      hardLimit: null,
+    }
+
+    const snapshot = normalizeCursorUsageLimits(raw, NOW)
+
+    expect(snapshot.credits).toMatchObject({
+      usedAmount: 5,
+      limitAmount: 100,
+      usedPercent: 5,
+    })
+  })
+})
 describe("mergeCodexRateLimitPush", () => {
   test("overlays pushed windows onto the previous full read", () => {
     const prev = normalizeCodexRateLimits(
@@ -395,7 +466,7 @@ describe("UsageLimitsManager", () => {
     expect(snapshot.providers.map((p) => p.provider)).toEqual(["claude", "codex", "cursor", "grok", "pi"])
     expect(snapshot.providers[0]?.status).toBe("ok")
     expect(snapshot.providers[1]?.status).toBe("ok")
-    expect(snapshot.providers[2]?.status).toBe("unavailable")
+    expect(snapshot.providers[2]?.status).toBe("unknown")
     expect(snapshot.providers[3]?.status).toBe("unknown")
     expect(snapshot.providers[4]?.status).toBe("not_applicable")
     expect(emitted).toBeGreaterThanOrEqual(2)
