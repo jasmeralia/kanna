@@ -61,6 +61,7 @@ import { useSendMessage } from "./useSendMessage"
 import { useShareExport } from "./useShareExport"
 import { useUpdateRestart } from "./useUpdateRestart"
 import type { EditorOpenSettings, OpenExternalAction, TerminalPreset } from "../../shared/protocol"
+import { applySidebarPatch, type SidebarPatch } from "../../shared/sidebar-patch"
 
 export {
   getUiUpdateReadinessPath,
@@ -307,11 +308,46 @@ export function useKannaState(activeChatId: string | null): KannaState {
   // sidebar field several times a second, and holding the snapshot here would
   // re-render this hook's whole subtree — the chat page included — every time.
   // Consumers select the slice they paint (see stores/sidebarStore).
+  //
+  // Patches rather than full snapshots (see shared/sidebar-patch.ts). They
+  // apply to `held`, the server's last snapshot as sent, not to the store,
+  // which also carries the local drag order. A patch that doesn't start from
+  // `held` means the two fell out of step; a fresh subscription starts over
+  // with a reset. A full snapshot still arrives when the server can't patch.
   useEffect(() => {
-    return socket.subscribe<SidebarData>({ type: "sidebar" }, (snapshot) => {
-      useSidebarStore.getState().setSnapshot(snapshot)
-      setCommandError(null)
-    })
+    let held: { revision: number | null; data: SidebarData } | null = null
+    let unsubscribe = () => {}
+    const subscribe = () => {
+      held = null
+      unsubscribe = socket.subscribe<SidebarData | SidebarPatch>({ type: "sidebar", patches: true }, (snapshot) => {
+        let data: SidebarData
+        if ("projectGroups" in snapshot) {
+          data = snapshot
+          held = { revision: null, data }
+        } else {
+          if (snapshot.from !== null && snapshot.from !== held?.revision) {
+            resubscribe()
+            return
+          }
+          try {
+            data = applySidebarPatch(held?.data ?? null, snapshot)
+          } catch (error) {
+            console.warn("[sidebar] patch did not apply, resubscribing:", error)
+            resubscribe()
+            return
+          }
+          held = { revision: snapshot.to, data }
+        }
+        useSidebarStore.getState().setSnapshot(data)
+        setCommandError(null)
+      })
+    }
+    const resubscribe = () => {
+      unsubscribe()
+      subscribe()
+    }
+    subscribe()
+    return () => unsubscribe()
   }, [socket])
 
   useEffect(() => {
@@ -695,6 +731,13 @@ export function useKannaState(activeChatId: string | null): KannaState {
     }
   }, [optimisticProcessing, optimisticScopeId, runtime?.status])
 
+  // After the ack, the optimistic status holds until a chat snapshot that
+  // arrived after the ack still says idle. The server queues its "running"
+  // push before it acks, so the first push after the ack is the answer. A fixed
+  // grace period used to decide this instead, and it lost to the snapshot on a
+  // new chat (navigate, subscribe, first push), so the indicator blinked out
+  // and back. The fallback only covers a push that never comes.
+  const ackedSnapshotRef = useRef<{ ackedAt: number; snapshot: ChatSnapshot | null } | null>(null)
   useEffect(() => {
     if (!optimisticProcessing?.ackedAt || optimisticProcessing.scopeId !== optimisticScopeId) {
       return
@@ -702,15 +745,20 @@ export function useKannaState(activeChatId: string | null): KannaState {
     if (runtime?.status && runtime.status !== "idle") {
       return
     }
+    const { ackedAt } = optimisticProcessing
+    if (ackedSnapshotRef.current?.ackedAt !== ackedAt) {
+      ackedSnapshotRef.current = { ackedAt, snapshot: activeChatSnapshot }
+    }
+    const heardBack = activeChatSnapshot !== null && activeChatSnapshot !== ackedSnapshotRef.current.snapshot
     const timeoutId = window.setTimeout(() => {
       setOptimisticProcessing((current) => (
-        current?.scopeId === optimisticScopeId && current.ackedAt === optimisticProcessing.ackedAt
+        current?.scopeId === optimisticScopeId && current.ackedAt === ackedAt
           ? null
           : current
       ))
-    }, 300)
+    }, heardBack ? 0 : 5_000)
     return () => window.clearTimeout(timeoutId)
-  }, [optimisticProcessing, optimisticScopeId, runtime?.status])
+  }, [activeChatSnapshot, optimisticProcessing, optimisticScopeId, runtime?.status])
 
   useEffect(() => {
     setOptimisticUserPrompts((current) => {
@@ -905,14 +953,12 @@ export function useKannaState(activeChatId: string | null): KannaState {
   }, [socket])
 
   /**
-   * "Setup Git" from a sidebar hover card: the same confirm-then-`git init` the
-   * chat navbar's branch slot runs, for a chat that isn't necessarily the one
-   * you have open. The server resolves the project from the chat, and
+   * "Setup Git" from a sidebar hover card: confirm, then `git init`, for a
+   * chat that isn't necessarily the one you have open. The server resolves the project from the chat, and
    * `chat.initGit` is a no-op success on a folder that turns out to already be
    * a repo — so a stale snapshot costs nothing.
-   *
-   * Unlike the navbar's copy this doesn't open the git panel afterwards: you
-   * were pointing at a row in the sidebar, not asking to go anywhere.
+   * It doesn't open the widgets afterwards: you were pointing at a row in the
+   * sidebar, not asking to go anywhere.
    */
   const handleSetupGit = useCallback(async (chatId: string) => {
     const confirmed = await dialog.confirm({
@@ -1004,9 +1050,11 @@ export function useKannaState(activeChatId: string | null): KannaState {
     handleOpenStandaloneShareLink,
   } = useShareExport({ socket, activeChatId, resolvedTheme, dialog, setCommandError })
 
+  // The sidebar's New Chat: a chat in the project you're looking at, like the
+  // iOS app. Picking another project is the empty chat's path button.
   const handleCompose = useCallback(() => {
     const intent = resolveComposeIntent({
-      selectedProjectId,
+      selectedProjectId: activeProjectId,
       sidebarProjectId: getMostRecentlyActiveProjectId(getSidebarProjectGroups()),
       fallbackLocalProjectPath,
     })
@@ -1016,7 +1064,7 @@ export function useKannaState(activeChatId: string | null): KannaState {
     }
 
     navigate("/")
-  }, [fallbackLocalProjectPath, navigate, selectedProjectId, startChatFromIntent])
+  }, [activeProjectId, fallbackLocalProjectPath, navigate, startChatFromIntent])
 
   // On mobile the sidebar is the `/` page rather than an overlay, so "open"
   // means navigate there. Desktop always shows it and never calls this.

@@ -21,6 +21,7 @@ import type {
   EditorPreset,
   TerminalPreset,
 } from "./types"
+import type { SidebarPatch } from "./sidebar-patch"
 
 export type { EditorPreset, TerminalPreset }
 
@@ -48,7 +49,14 @@ export interface ProjectQuickAction {
 }
 
 export type SubscriptionTopic =
-  | { type: "sidebar" }
+  | {
+    type: "sidebar"
+    /**
+     * Answer with `sidebar-patch` snapshots instead of full ones. Optional so
+     * the iOS app, which only decodes full snapshots, is unaffected.
+     */
+    patches?: boolean
+  }
   | { type: "local-projects" }
   | { type: "update" }
   | { type: "keybindings" }
@@ -119,7 +127,10 @@ export type ClientCommand =
   | { type: "project.remove"; projectId: string }
   | { type: "project.remove"; localPath: string }
   | { type: "sidebar.reorderProjectGroups"; projectIds: string[] }
-  | { type: "project.readDiffPatch"; projectId: string; path: string }
+  // fullContext: the whole file around the changes, not three lines either side.
+  | { type: "project.readDiffPatch"; projectId: string; path: string; fullContext?: boolean }
+  | { type: "project.readCommit"; projectId: string; sha: string }
+  | { type: "project.readBranch"; projectId: string; branch: SelectedBranch }
   // Committing is addressed by project, not by chat: the diff panel's file
   // selection belongs to the project it is rendering, and the active chat can
   // move to another project mid-flow (notably across the "generate a message"
@@ -293,6 +304,7 @@ export type ClientCommand =
   | { type: "chat.stopDraining"; chatId: string }
   | {
       type: "chat.exportStandalone"
+      sourceOrigin?: string
       chatId: string
       theme: "light" | "dark"
       attachmentMode: StandaloneTranscriptAttachmentMode
@@ -343,6 +355,7 @@ export type ClientEnvelope =
 
 export type ServerSnapshot =
   | { type: "sidebar"; data: SidebarData }
+  | { type: "sidebar-patch"; data: SidebarPatch }
   | { type: "local-projects"; data: LocalProjectsSnapshot }
   | { type: "update"; data: UpdateSnapshot }
   | { type: "keybindings"; data: KeybindingsSnapshot }

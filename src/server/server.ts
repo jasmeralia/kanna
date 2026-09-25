@@ -48,6 +48,7 @@ import { createWsRouter, type ClientState } from "./ws-router"
 import { instanceFingerprint } from "./instance"
 import { deleteProjectUpload, inferAttachmentContentType, inferProjectFileContentType, persistProjectUpload } from "./uploads"
 import { getProjectUploadDir } from "./paths"
+import { inheritShellPath } from "./process-utils"
 
 const MAX_UPLOAD_FILES = 50
 const MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024
@@ -145,6 +146,9 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const hostname = options.host ?? "127.0.0.1"
   const strictPort = options.strictPort ?? false
   const runtimeProfile = getRuntimeProfile()
+  // Runs alongside the store setup below (~0.5 s for a zsh with nvm) and is
+  // awaited before anything can start an agent.
+  const shellPathReady = inheritShellPath()
   const auth = options.password ? createAuthManager(options.password, { trustProxy: options.trustProxy ?? false }) : null
   const diagnostics = new PerformanceLog(options.dataDir ?? getDataDir(homedir()), undefined, options.update?.version)
   const store = new EventStore(options.dataDir, diagnostics)
@@ -167,7 +171,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   let discoveredProjects: DiscoveredProject[] = []
 
   async function refreshDiscovery() {
-    discoveredProjects = discoverProjects()
+    discoveredProjects = await discoverProjects()
     return discoveredProjects
   }
 
@@ -262,6 +266,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const usageLimits = new UsageLimitsManager(path.join(store.dataDir, "usage-limits.json"), {
     fetchClaudeUsage: () => agent.fetchClaudeUsage(),
     fetchCodexRateLimits: () => agent.fetchCodexRateLimits(),
+    fetchGrokUsage: () => agent.fetchGrokUsage(),
   })
   await usageLimits.initialize()
   agent.setClaudeRateLimitListener((info) => usageLimits.recordClaudeRateLimitPush(info))
@@ -279,6 +284,9 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
       void usageLimits.refresh({ force: true }).catch(() => undefined)
       if (service === "cursor") {
         void agent.refreshCursorModelCatalog()
+      }
+      if (service === "grok") {
+        void agent.refreshGrokModelCatalog()
       }
       if (service === "codex") {
         void agent.refreshCodexModelCatalog()
@@ -322,6 +330,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   // catalog (no-op when the CLI is missing or logged out); broadcasts on change.
   void agent.refreshCursorModelCatalog()
   void agent.refreshCodexModelCatalog()
+  void agent.refreshGrokModelCatalog()
   // Seed the pi provider's model picker from saved fave models before the
   // first snapshots go out.
   void readLlmProviderSnapshot()
@@ -372,6 +381,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
       await router.broadcastSnapshots()
     }
   }
+  await shellPathReady
   // Chats that were mid-turn when Kanna last exited pick up where they left
   // off. Not awaited — each resume starts a harness process, and boot should
   // not wait on them; chained onto the GC sweep so a chat about to be archived
