@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { readFileSync } from "node:fs"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -8,10 +9,18 @@ import {
   mergeCodexRateLimitPush,
   normalizeClaudeUsage,
   normalizeCodexRateLimits,
+  normalizeCursorUsageLimits,
   normalizeGrokAccountUsage,
+  type CursorUsageRaw,
 } from "./usage-limits"
 
 const NOW = "2026-07-22T10:00:00.000Z"
+const CURSOR_RESETS_AT = "2026-09-07T15:55:25.000Z"
+
+function loadCursorFixture(name: string): CursorUsageRaw {
+  const text = readFileSync(path.join(import.meta.dir, "__fixtures__", name), "utf8")
+  return JSON.parse(text) as CursorUsageRaw
+}
 
 let tempDirs: string[] = []
 
@@ -309,6 +318,76 @@ describe("normalizeCodexRateLimits", () => {
   })
 })
 
+describe("normalizeCursorUsageLimits", () => {
+  test("maps Cursor Models / Other Models windows from a Pro account fixture", () => {
+    const snapshot = normalizeCursorUsageLimits(loadCursorFixture("cursor-usage-pro.json"), NOW)
+
+    expect(snapshot.status).toBe("ok")
+    expect(snapshot.plan).toBe("Pro")
+    expect(snapshot.windows.map((w) => w.id)).toEqual(["cursor_models", "other_models"])
+    expect(snapshot.windows[0]).toMatchObject({
+      label: "Cursor Models",
+      usedPercent: 10.96,
+      resetsAt: CURSOR_RESETS_AT,
+      windowMinutes: null,
+      modelLabel: null,
+      recordedAt: NOW,
+      source: "on_demand",
+    })
+    expect(snapshot.windows[1]).toMatchObject({
+      label: "Other Models",
+      usedPercent: 37.644444444444446,
+      resetsAt: CURSOR_RESETS_AT,
+      windowMinutes: null,
+      modelLabel: null,
+    })
+    expect(snapshot.credits).toBeNull()
+    expect(snapshot.updatedAt).toBe(NOW)
+  })
+
+  test("renders on-demand spend when the account has an individual cap", () => {
+    const snapshot = normalizeCursorUsageLimits(loadCursorFixture("cursor-usage-ondemand.json"), NOW)
+
+    expect(snapshot.credits).toMatchObject({
+      label: "On-demand",
+      usedAmount: 12.5,
+      limitAmount: 50,
+      usedPercent: 25,
+      currency: "USD",
+    })
+  })
+
+  test("missing usage payload is unavailable", () => {
+    expect(normalizeCursorUsageLimits(null, NOW).status).toBe("unavailable")
+    expect(normalizeCursorUsageLimits({ planInfo: { planInfo: { planName: "Pro" } } }, NOW).status)
+      .toBe("unavailable")
+  })
+
+  // Team/pooled accounts report their shared cap in `pooledLimit` with
+  // `individualLimit` unset — best-effort mapping, see the comment in
+  // normalizeCursorUsageLimits. We don't have a real pooled-account fixture
+  // to confirm `individualUsed` is the right numerator against it.
+  test("falls back to the pooled limit when there is no individual cap", () => {
+    const raw: CursorUsageRaw = {
+      currentPeriodUsage: {
+        planUsage: {},
+        spendLimitUsage: { limitType: "pooled", individualUsed: 500, pooledLimit: 10_000 },
+        enabled: true,
+      },
+      planInfo: null,
+      hardLimit: null,
+    }
+
+    const snapshot = normalizeCursorUsageLimits(raw, NOW)
+
+    expect(snapshot.credits).toMatchObject({
+      usedAmount: 5,
+      limitAmount: 100,
+      usedPercent: 5,
+    })
+  })
+})
+
 describe("mergeCodexRateLimitPush", () => {
   test("overlays pushed windows onto the previous full read", () => {
     const prev = normalizeCodexRateLimits(
@@ -395,7 +474,7 @@ describe("UsageLimitsManager", () => {
     expect(snapshot.providers.map((p) => p.provider)).toEqual(["claude", "codex", "cursor", "grok", "pi"])
     expect(snapshot.providers[0]?.status).toBe("ok")
     expect(snapshot.providers[1]?.status).toBe("ok")
-    expect(snapshot.providers[2]?.status).toBe("unavailable")
+    expect(snapshot.providers[2]?.status).toBe("unknown")
     expect(snapshot.providers[3]?.status).toBe("unknown")
     expect(snapshot.providers[4]?.status).toBe("not_applicable")
     expect(emitted).toBeGreaterThanOrEqual(2)
@@ -484,6 +563,78 @@ describe("UsageLimitsManager", () => {
     const codex = snapshot.providers.find((p) => p.provider === "codex")
     expect(claude?.windows[0]).toMatchObject({ id: "five_hour", usedPercent: 42, source: "turn_push" })
     expect(codex?.windows[0]).toMatchObject({ id: "codex:primary", usedPercent: 12, source: "turn_push" })
+    manager.dispose()
+  })
+
+  test("refresh applies cursor when fetchCursorUsage is wired", async () => {
+    const filePath = await createTempFilePath()
+    const manager = new UsageLimitsManager(filePath, {
+      now: () => new Date(NOW),
+      fetchCursorUsage: async () => loadCursorFixture("cursor-usage-pro.json"),
+    })
+    await manager.initialize()
+    await manager.refresh()
+
+    const cursor = manager.getSnapshot().providers.find((p) => p.provider === "cursor")
+    expect(cursor?.status).toBe("ok")
+    expect(cursor?.plan).toBe("Pro")
+    expect(cursor?.windows.map((w) => w.id)).toEqual(["cursor_models", "other_models"])
+    manager.dispose()
+  })
+
+  test("refresh persists and restores cursor usage marked as cache", async () => {
+    const filePath = await createTempFilePath()
+    const writer = new UsageLimitsManager(filePath, {
+      now: () => new Date(NOW),
+      fetchCursorUsage: async () => loadCursorFixture("cursor-usage-pro.json"),
+    })
+    await writer.initialize()
+    await writer.refresh()
+    writer.dispose()
+
+    const persisted = JSON.parse(await readFile(filePath, "utf8"))
+    expect(persisted.providers.cursor.windows).toHaveLength(2)
+
+    const reader = new UsageLimitsManager(filePath)
+    await reader.initialize()
+    const cursor = reader.getSnapshot().providers.find((p) => p.provider === "cursor")
+    expect(cursor?.windows[0]).toMatchObject({ source: "cache", usedPercent: 10.96 })
+    reader.dispose()
+  })
+
+  test("a failed cursor refresh keeps last-known windows", async () => {
+    const filePath = await createTempFilePath()
+    let fail = false
+    const manager = new UsageLimitsManager(filePath, {
+      now: () => new Date(NOW),
+      fetchCursorUsage: async () => {
+        if (fail) throw new Error("probe timed out")
+        return loadCursorFixture("cursor-usage-pro.json")
+      },
+    })
+    await manager.initialize()
+    await manager.refresh()
+    fail = true
+    await manager.refresh({ force: true })
+
+    const cursor = manager.getSnapshot().providers.find((p) => p.provider === "cursor")
+    expect(cursor?.windows).toHaveLength(2)
+    expect(cursor?.detail).toContain("probe timed out")
+    manager.dispose()
+  })
+
+  test("cursor auth failures surface a sign-in hint", async () => {
+    const filePath = await createTempFilePath()
+    const manager = new UsageLimitsManager(filePath, {
+      now: () => new Date(NOW),
+      fetchCursorUsage: async () => null,
+    })
+    await manager.initialize()
+    await manager.refresh()
+
+    const cursor = manager.getSnapshot().providers.find((p) => p.provider === "cursor")
+    expect(cursor?.status).toBe("unavailable")
+    expect(cursor?.detail).toContain("cursor-agent login")
     manager.dispose()
   })
 })
