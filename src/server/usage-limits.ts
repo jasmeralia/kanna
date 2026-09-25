@@ -10,6 +10,7 @@ import type {
   UsageLimitWindow,
   UsageLimitsSnapshot,
 } from "../shared/types"
+import { grokProductUsageWindows, moneyVal, type GrokBillingRaw, type GrokUserRaw } from "./grok-cli"
 
 // ---------------------------------------------------------------------------
 // Raw provider shapes (subset of what the SDK / app-server return). We keep
@@ -612,7 +613,7 @@ export function normalizeCursorUsageLimits(
   // reports its shared cap in `pooledLimit` with `individualLimit` unset. This
   // is an unofficial, undocumented endpoint and we don't have a real pooled
   // account to confirm `individualUsed` is still the right numerator against
-  // it — falling back to it is a best-effort improvement over ignoring
+  // it - falling back to it is a best-effort improvement over ignoring
   // `pooledLimit` entirely, not a verified-correct reading.
   const limitCents = spend?.individualLimit
     ?? spend?.pooledLimit
@@ -647,6 +648,74 @@ export function normalizeCursorUsageLimits(
   return snapshot
 }
 
+export interface GrokUsageRaw {
+  billing: GrokBillingRaw
+  user: GrokUserRaw
+}
+
+export function normalizeGrokAccountUsage(
+  raw: GrokUsageRaw | null,
+  now: string,
+  source: UsageLimitSource = "on_demand",
+): ProviderUsageSnapshot {
+  const base: ProviderUsageSnapshot = {
+    provider: "grok",
+    status: "unknown",
+    plan: null,
+    windows: [],
+    credits: null,
+    detail: null,
+    updatedAt: null,
+  }
+  if (!raw) {
+    return { ...base, status: "unavailable", detail: "Could not read Grok usage. Sign in with grok login." }
+  }
+
+  const plan = raw.user.subscriptionTier ?? null
+  const windows: UsageLimitWindow[] = grokProductUsageWindows(raw.billing).map((window) => ({
+    id: window.id,
+    label: window.label,
+    usedPercent: window.usedPercent == null || !Number.isFinite(window.usedPercent)
+      ? null
+      : Math.max(0, Math.min(100, window.usedPercent)),
+    resetsAt: window.resetsAt,
+    recordedAt: now,
+    source,
+    windowMinutes: null,
+    modelLabel: null,
+  }))
+
+  const onDemandUsed = moneyVal(raw.billing.config?.onDemandUsed)
+  const onDemandCap = moneyVal(raw.billing.config?.onDemandCap)
+  const prepaid = moneyVal(raw.billing.config?.prepaidBalance)
+  let credits: UsageLimitCredits | null = null
+  if ((onDemandCap != null && onDemandCap > 0) || (prepaid != null && prepaid > 0)) {
+    credits = {
+      label: prepaid && prepaid > 0 ? "Prepaid balance" : "On-demand",
+      usedPercent: onDemandCap && onDemandCap > 0 && onDemandUsed != null
+        ? Math.max(0, Math.min(100, (onDemandUsed / onDemandCap) * 100))
+        : null,
+      usedAmount: onDemandUsed,
+      limitAmount: onDemandCap,
+      currency: "USD",
+      detail: prepaid && prepaid > 0 ? `Prepaid $${prepaid}` : null,
+      recordedAt: now,
+      source,
+    }
+  }
+
+  const snapshot: ProviderUsageSnapshot = {
+    ...base,
+    status: windows.length > 0 ? "ok" : "unavailable",
+    plan,
+    windows,
+    credits,
+    detail: windows.length > 0 ? null : "No Grok usage windows reported.",
+  }
+  snapshot.updatedAt = latestRecordedAt(snapshot)
+  return snapshot
+}
+
 function staticProviderSnapshot(provider: AgentProvider): ProviderUsageSnapshot {
   if (provider === "pi") {
     return {
@@ -659,7 +728,19 @@ function staticProviderSnapshot(provider: AgentProvider): ProviderUsageSnapshot 
       updatedAt: null,
     }
   }
-  // cursor (Phase 1): fetch wired in a follow-up; normalizer + fixtures land first.
+  if (provider === "grok") {
+    return {
+      provider,
+      status: "unknown",
+      plan: null,
+      windows: [],
+      credits: null,
+      detail: null,
+      updatedAt: null,
+    }
+  }
+  // cursor: this fallback is bootstrap-only, immediately overridden by the
+  // constructor's explicit "unknown" snapshot once fetchCursorUsage is wired.
   return {
     provider,
     status: "unavailable",
@@ -675,7 +756,7 @@ function staticProviderSnapshot(provider: AgentProvider): ProviderUsageSnapshot 
 // Manager
 // ---------------------------------------------------------------------------
 
-const PROVIDER_ORDER: AgentProvider[] = ["claude", "codex", "cursor", "pi"]
+const PROVIDER_ORDER: AgentProvider[] = ["claude", "codex", "cursor", "grok", "pi"]
 
 /** Non-forced refreshes within this window reuse the last read (probes are pricey). */
 const REFRESH_TTL_MS = 60_000
@@ -692,6 +773,8 @@ export interface UsageLimitsManagerDeps {
   fetchCodexRateLimits?: () => Promise<CodexRateLimitsRaw | null>
   /** Fetch a fresh Cursor usage read, or null when unavailable. */
   fetchCursorUsage?: () => Promise<CursorUsageRaw | null>
+  /** Fetch Grok Build billing + subscription from cli-chat-proxy. */
+  fetchGrokUsage?: () => Promise<GrokUsageRaw | null>
   now?: () => Date
 }
 
@@ -733,7 +816,7 @@ export class UsageLimitsManager {
       const text = await readFile(this.filePath, "utf8")
       if (text.trim()) {
         const parsed = JSON.parse(text) as UsageLimitsFile
-        for (const provider of ["claude", "codex", "cursor"] as const) {
+        for (const provider of ["claude", "codex", "cursor", "grok"] as const) {
           const persisted = parsed.providers?.[provider]
           if (persisted && typeof persisted === "object") {
             // Mark persisted windows as cache-sourced so the UI can show staleness.
@@ -817,7 +900,7 @@ export class UsageLimitsManager {
   }
 
   private async doRefresh() {
-    await Promise.all([this.refreshClaude(), this.refreshCodex(), this.refreshCursor()])
+    await Promise.all([this.refreshClaude(), this.refreshCodex(), this.refreshCursor(), this.refreshGrok()])
     this.lastRefreshAt = (this.deps.now?.() ?? new Date()).getTime()
     // Make refresh() a durable point: the persisted cache reflects this read.
     await this.persistChain
@@ -900,6 +983,24 @@ export class UsageLimitsManager {
     }
   }
 
+  private async refreshGrok() {
+    if (!this.deps.fetchGrokUsage) return
+    try {
+      const raw = await this.deps.fetchGrokUsage()
+      this.applyRefreshed("grok", normalizeGrokAccountUsage(raw, this.nowIso()))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const isAuth = /401|403|auth|login|sign/i.test(message)
+      this.applyRefreshed("grok", {
+        provider: "grok", status: "unavailable", plan: null, windows: [], credits: null,
+        detail: isAuth
+          ? "Sign in to Grok Build to see usage limits."
+          : `Failed to read Grok usage: ${message}`,
+        updatedAt: null,
+      })
+    }
+  }
+
   private async persist() {
     const file: UsageLimitsFile = {
       version: 1,
@@ -907,6 +1008,7 @@ export class UsageLimitsManager {
         claude: this.snapshots.get("claude"),
         codex: this.snapshots.get("codex"),
         cursor: this.snapshots.get("cursor"),
+        grok: this.snapshots.get("grok"),
       },
     }
     try {

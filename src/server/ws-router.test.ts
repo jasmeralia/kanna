@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import path from "node:path"
-import type { AppSettingsSnapshot, KeybindingsSnapshot, LlmProviderSnapshot, UpdateSnapshot } from "../shared/types"
+import type { AppSettingsSnapshot, KeybindingsSnapshot, LlmProviderSnapshot, SidebarData, UpdateSnapshot } from "../shared/types"
+import { applySidebarPatch, type SidebarPatch } from "../shared/sidebar-patch"
 import { PROTOCOL_VERSION } from "../shared/types"
 import { findTranscriptWindowStart } from "../shared/transcript-window"
 import { createEmptyState } from "./events"
@@ -132,6 +133,14 @@ const DEFAULT_APP_SETTINGS_SNAPSHOT: AppSettingsSnapshot = {
       planMode: false,
       autoPlan: false,
     },
+    grok: {
+      model: "grok-4.6",
+      modelOptions: {
+        reasoningEffort: "high",
+      },
+      planMode: false,
+      autoPlan: false,
+    },
     pi: {
       model: "~anthropic/claude-fable-latest",
       modelOptions: {
@@ -230,10 +239,10 @@ describe("skills helpers", () => {
       const snapshot = await listGlobalSkillsWithSources({ home, lockFilePath: lockPath })
       const byName = new Map(snapshot.skills.map((skill) => [skill.name, skill]))
 
-      // Lock-tracked skill carries its marketplace source; ~/.agents attributes codex/cursor/pi.
+      // Lock-tracked skill carries its marketplace source; ~/.agents attributes codex/cursor/grok/pi.
       expect(byName.get("installed-skill")).toMatchObject({
         source: "owner/repo",
-        providers: ["codex", "cursor", "pi"],
+        providers: ["codex", "cursor", "grok", "pi"],
       })
       // Hand-dropped skill still listed, claude-attributed, with no source.
       expect(byName.get("hand-dropped")?.providers).toEqual(["claude"])
@@ -334,6 +343,8 @@ function createFakeDiffStore(overrides: Record<string, unknown> = {}): CreateWsR
     discardFile: async () => ({ snapshotChanged: false }),
     ignoreFile: async () => ({ snapshotChanged: false }),
     readPatch: async () => ({ patch: "" }),
+    readCommit: async () => ({ sha: "", parentCount: 1, files: [], totalFileCount: 0, additions: 0, deletions: 0 }),
+    readBranch: async () => ({}),
     ...overrides,
   } as never
 }
@@ -1585,6 +1596,81 @@ describe("ws-router", () => {
     })
   })
 
+  test("a patch subscription gets a reset and then only the rows that changed, a plain one full snapshots", async () => {
+    const state = createEmptyState()
+    state.projectsById.set("project-1", {
+      id: "project-1",
+      localPath: "/tmp/project",
+      title: "Project",
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    state.projectIdsByPath.set("/tmp/project", "project-1")
+    for (const [id, unread] of [["chat-1", true], ["chat-2", false]] as const) {
+      state.chatsById.set(id, {
+        id,
+        projectId: "project-1",
+        title: id,
+        createdAt: 1,
+        updatedAt: 1,
+        unread,
+        provider: null,
+        planMode: false,
+        autoPlan: false,
+        sessionToken: null,
+        lastTurnOutcome: null,
+      })
+    }
+
+    const router = createTestRouter({
+      store: createFakeStore({
+        state,
+        async setChatReadState(chatId: string, unread: boolean) {
+          state.chatsById.get(chatId)!.unread = unread
+        },
+      }),
+    })
+    const patchWs = new FakeWebSocket()
+    const plainWs = new FakeWebSocket()
+    router.handleOpen(patchWs as never)
+    router.handleOpen(plainWs as never)
+
+    await router.handleMessage(patchWs as never, JSON.stringify({
+      v: 1, type: "subscribe", id: "sidebar-p", topic: { type: "sidebar", patches: true },
+    }))
+    await router.handleMessage(plainWs as never, JSON.stringify({
+      v: 1, type: "subscribe", id: "sidebar-f", topic: { type: "sidebar" },
+    }))
+
+    const reset = (patchWs.sent.at(-1) as { snapshot: { type: string; data: SidebarPatch } }).snapshot
+    expect(reset.type).toBe("sidebar-patch")
+    expect(reset.data.from).toBeNull()
+    expect(reset.data.rows?.map((row) => row.chatId).sort()).toEqual(["chat-1", "chat-2"])
+    const held = applySidebarPatch(null, reset.data)
+
+    await router.handleMessage(patchWs as never, JSON.stringify({
+      v: 1, type: "command", id: "mark-read", command: { type: "chat.markRead", chatId: "chat-1" },
+    }))
+
+    const change = (patchWs.sent.at(-1) as { snapshot: { type: string; data: SidebarPatch } }).snapshot
+    expect(change.type).toBe("sidebar-patch")
+    expect(change.data.from).toBe(reset.data.to)
+    expect(change.data.rows?.map((row) => ({ chatId: row.chatId, unread: row.unread }))).toEqual([
+      { chatId: "chat-1", unread: false },
+    ])
+    expect(change.data.headers).toBeUndefined()
+    expect(change.data.lists).toBeUndefined()
+    const next = applySidebarPatch(held, change.data)
+    expect(next.projectGroups[0]!.chats.map((chat) => [chat.chatId, chat.unread])).toEqual([
+      ["chat-1", false],
+      ["chat-2", false],
+    ])
+
+    const full = (plainWs.sent.at(-1) as { snapshot: { type: string; data: SidebarData } }).snapshot
+    expect(full.type).toBe("sidebar")
+    expect(full.data.projectGroups[0]!.chats.find((chat) => chat.chatId === "chat-1")?.unread).toBe(false)
+  })
+
   test("reorders sidebar project groups on the server and rebroadcasts the snapshot", async () => {
     const state = createEmptyState()
     state.projectsById.set("project-1", {
@@ -2540,7 +2626,7 @@ describe("transcript windows", () => {
       // The client's cache may hold an old catalog, so the incremental first
       // push carries the current one.
       expect(chatData(ws, 0).incremental).toBe(true)
-      expect(providersOf(0)?.map((provider) => provider.id)).toEqual(["claude", "codex", "cursor", "pi"])
+      expect(providersOf(0)?.map((provider) => provider.id)).toEqual(["claude", "codex", "cursor", "grok", "pi"])
 
       // Unchanged catalog: no later push repeats it.
       await router.broadcastSnapshots()

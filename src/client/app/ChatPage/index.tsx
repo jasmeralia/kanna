@@ -1,32 +1,36 @@
 import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentProps, type CSSProperties, type DragEvent, type ReactNode, type RefObject } from "react"
 import type { GroupImperativeHandle } from "react-resizable-panels"
-import { useOutletContext } from "react-router-dom"
+import { useNavigate, useOutletContext } from "react-router-dom"
 import type { ChatInputHandle } from "../../components/chat-ui/ChatInput"
 import { ChatNavbar } from "../../components/chat-ui/ChatNavbar"
-// Code-split: a sidebar panel, not first paint.
-const BrowserPanel = lazy(() =>
-  import("../../components/chat-ui/BrowserPanel").then((m) => ({ default: m.BrowserPanel }))
+import { WidgetsSidebar } from "../../components/chat-ui/widgets/WidgetsSidebar"
+// Code-split: GitWidgets pulls @pierre/diffs, which pulls shiki core and ~300
+// language grammars. The widget column is not first paint, so none of that
+// belongs in the entry chunk. Type-only import keeps the prop types.
+import type { GitWidgets as GitWidgetsComponent } from "../../components/chat-ui/widgets/GitWidgets"
+const GitWidgets = lazy(() =>
+  import("../../components/chat-ui/widgets/GitWidgets").then((m) => ({ default: m.GitWidgets }))
 )
-// Code-split: GitPanel pulls @pierre/diffs, which pulls shiki core and ~300
-// language grammars. The git tab is a sidebar panel, not first paint, so none
-// of that belongs in the entry chunk. Type-only import keeps the prop types.
-import type { GitPanel as GitPanelComponent } from "../../components/chat-ui/GitPanel"
-const GitPanel = lazy(() =>
-  import("../../components/chat-ui/GitPanel").then((m) => ({ default: m.GitPanel }))
-)
-import { useAppDialog } from "../../components/ui/app-dialog"
 import { Card, CardContent } from "../../components/ui/card"
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "../../components/ui/resizable"
 import { actionMatchesEvent, getResolvedKeybindings } from "../../lib/keybindings"
 import { deriveLatestContextWindowSnapshot } from "../../lib/contextWindow"
 import { cn } from "../../lib/utils"
+import { buildChatJumpLocationState } from "../../lib/chat-navigation"
 import { snapshotDroppedFiles } from "../../lib/snapshotDroppedFiles"
 import {
   DEFAULT_RIGHT_SIDEBAR_SIZE,
-  DEFAULT_RIGHT_SIDEBAR_VISIBILITY_STATE,
   RIGHT_SIDEBAR_MIN_WIDTH_PX,
   useRightSidebarStore,
+  useWidgetsOpen,
 } from "../../stores/rightSidebarStore"
+import { ViewerLayer, useViewerOpen } from "../../components/viewer/ViewerLayer"
+import { useViewerUrlSync } from "../../components/viewer/viewerUrl"
+import { opensInViewer, projectRelativePath } from "../../components/viewer/localLinks"
+import type { OpenLocalLinkTarget } from "../../components/messages/shared"
+import { shouldOpenLocalFileLinkInEditor } from "../../lib/pathUtils"
+import { openViewer } from "../../stores/viewerStore"
+import type { DiffViewerContext } from "../../components/chat-ui/git/DiffViewer"
 import { useProjectRepoUrl } from "../../stores/sidebarStore"
 import { DEFAULT_PROJECT_TERMINAL_LAYOUT, useTerminalLayoutStore } from "../../stores/terminalLayoutStore"
 import { useTerminalPreferencesStore } from "../../stores/terminalPreferencesStore"
@@ -36,7 +40,7 @@ import { TERMINAL_TOGGLE_ANIMATION_DURATION_MS } from "../terminalToggleAnimatio
 import { useRightSidebarToggleAnimation } from "../useRightSidebarToggleAnimation"
 import { useStickyChatFocus } from "../useStickyChatFocus"
 import { useTerminalToggleAnimation } from "../useTerminalToggleAnimation"
-import type { AgentProvider, ChatSkillsSnapshot, TranscriptEntry } from "../../../shared/types"
+import type { AgentProvider, ChatSkillsSnapshot, SubagentActivity, TranscriptEntry } from "../../../shared/types"
 import type { KannaState } from "../useKannaState"
 import { getNextMeasuredInputHeight, getTranscriptPaddingBottom } from "../useKannaState"
 import { ChatInputDock } from "./ChatInputDock"
@@ -63,16 +67,30 @@ export {
 
 /** Stable identity so a chat without a snapshot does not re-derive per render. */
 const EMPTY_TRANSCRIPT_ENTRIES: TranscriptEntry[] = []
+const EMPTY_SUBAGENTS: readonly SubagentActivity[] = []
 
-function useEmptyStateTyping(showEmptyState: boolean, activeChatId: string | null) {
+/**
+ * Types the empty-state line once each time the empty state appears. Not per
+ * chat: going from one new chat to another (switching project from the path
+ * button) keeps the empty state up, and retyping it read as the page reloading.
+ */
+function useEmptyStateTyping(showEmptyState: boolean) {
   const [typedEmptyStateText, setTypedEmptyStateText] = useState("")
   const [isEmptyStateTypingComplete, setIsEmptyStateTypingComplete] = useState(false)
+  // Reset in the render the empty state appears, not in the effect after it:
+  // the viewport decides on its entrance animation from the first frame, and
+  // a stale "typing complete" there would skip it.
+  const [wasShowingEmptyState, setWasShowingEmptyState] = useState(showEmptyState)
+  if (wasShowingEmptyState !== showEmptyState) {
+    setWasShowingEmptyState(showEmptyState)
+    if (showEmptyState) {
+      setTypedEmptyStateText("")
+      setIsEmptyStateTypingComplete(false)
+    }
+  }
 
   useEffect(() => {
     if (!showEmptyState) return
-
-    setTypedEmptyStateText("")
-    setIsEmptyStateTypingComplete(false)
 
     let characterIndex = 0
     const interval = window.setInterval(() => {
@@ -86,7 +104,7 @@ function useEmptyStateTyping(showEmptyState: boolean, activeChatId: string | nul
     }, EMPTY_STATE_TYPING_INTERVAL_MS)
 
     return () => window.clearInterval(interval)
-  }, [showEmptyState, activeChatId])
+  }, [showEmptyState])
 
   return { typedEmptyStateText, isEmptyStateTypingComplete }
 }
@@ -311,12 +329,12 @@ interface ChatWorkspaceProps {
   onLayoutChanged: (layout: Record<string, number>) => void
 }
 
-type ChatSidebarContentProps = ComponentProps<typeof GitPanelComponent>
+type GitWidgetsContentProps = ComponentProps<typeof GitWidgetsComponent>
 
-const ChatSidebarContent = memo(function ChatSidebarContent(props: ChatSidebarContentProps) {
+const GitWidgetsContent = memo(function GitWidgetsContent(props: GitWidgetsContentProps) {
   return (
-    <Suspense fallback={<div className="h-full w-full" />}>
-      <GitPanel
+    <Suspense fallback={null}>
+      <GitWidgets
         {...props}
         diffs={props.diffs ?? EMPTY_DIFF_SNAPSHOT}
       />
@@ -398,13 +416,13 @@ const MobileSidebarPane = memo(function MobileSidebarPane({
       <button
         type="button"
         className="absolute inset-0 bg-black/45 backdrop-blur-[1px]"
-        aria-label="Close changes sidebar"
+        aria-label="Close widgets"
         onClick={onClose}
       />
       <div
         ref={sidebarVisualRef}
         className={cn(
-          "absolute inset-y-0 right-0 flex w-[min(92vw,30rem)] max-w-full min-h-0 flex-col overflow-hidden border-l border-border bg-background shadow-2xl transition-transform duration-300 ease-out",
+          "absolute inset-y-0 right-0 flex w-[min(92vw,30rem)] max-w-full min-h-0 flex-col overflow-hidden bg-background shadow-2xl transition-transform duration-300 ease-out",
           "pt-[max(env(safe-area-inset-top),0px)] pb-[max(env(safe-area-inset-bottom),0px)]",
           showRightSidebar ? "translate-x-0" : "translate-x-full",
         )}
@@ -510,7 +528,6 @@ function ChatWorkspace({
 
 export function ChatPage() {
   const state = useOutletContext<KannaState>()
-  const dialog = useAppDialog()
   const layoutRootRef = useRef<HTMLDivElement>(null)
   const transcriptListRef = useRef<TranscriptScrollHandle | null>(null)
   const isAtEndRef = useRef(true)
@@ -522,12 +539,19 @@ export function ChatPage() {
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [pendingTerminalCommands, setPendingTerminalCommands] = useState<Record<string, string>>({})
   const [defaultModelsDialogOpen, setDefaultModelsDialogOpen] = useState(false)
-  const showEmptyState = state.messages.length === 0 && state.runtime?.title === "New Chat"
+  // While the next chat's snapshot loads there's no runtime to judge by, so the
+  // empty state holds whatever it last was. Dropping it for that gap is what
+  // made one new chat to another fade out and back in.
+  const settledShowEmptyStateRef = useRef(false)
+  const isChatLoading = Boolean(state.activeChatId && !state.runtime)
+  const showEmptyState = isChatLoading
+    ? settledShowEmptyStateRef.current
+    : state.messages.length === 0 && state.runtime?.title === "New Chat"
+  settledShowEmptyStateRef.current = showEmptyState
   const projectId = state.activeProjectId
   const projectTerminalLayout = useTerminalLayoutStore((store) => (projectId ? store.projects[projectId] : undefined))
   const storedTerminalLayout = projectTerminalLayout ?? DEFAULT_PROJECT_TERMINAL_LAYOUT
-  const projectRightSidebarVisibility = useRightSidebarStore((store) => (projectId ? store.projects[projectId] : undefined))
-  const rightSidebarVisibility = projectRightSidebarVisibility ?? DEFAULT_RIGHT_SIDEBAR_VISIBILITY_STATE
+  const widgetsOpen = useWidgetsOpen(projectId)
   const globalRightSidebarSize = useRightSidebarStore((store) => store.size)
   const addTerminal = useTerminalLayoutStore((store) => store.addTerminal)
   const removeTerminal = useTerminalLayoutStore((store) => store.removeTerminal)
@@ -536,8 +560,33 @@ export function ChatPage() {
   const resetMainSizes = useTerminalLayoutStore((store) => store.resetMainSizes)
   const setMainSizes = useTerminalLayoutStore((store) => store.setMainSizes)
   const setTerminalSizes = useTerminalLayoutStore((store) => store.setTerminalSizes)
-  const toggleRightPanel = useRightSidebarStore((store) => store.togglePanel)
-  const hideRightPanel = useRightSidebarStore((store) => store.hidePanel)
+  const toggleWidgets = useRightSidebarStore((store) => store.toggleWidgets)
+  const hideWidgets = useRightSidebarStore((store) => store.hideWidgets)
+  const viewerOpen = useViewerOpen()
+  // What's open survives a refresh: it's written to, and read from, the address.
+  useViewerUrlSync(projectId)
+  const projectLocalPath = state.runtime?.localPath ?? state.navbarLocalPath ?? null
+  // A file link that would open in the editor (or a CSV that would open in
+  // Numbers) opens in the viewer instead, when it's a file in this project
+  // (the only files the viewer can read); the editor is a button away there.
+  // Anything else, and an explicit choice from a link's context menu, goes
+  // where it always did.
+  const handleOpenLocalLink = useCallback<KannaState["handleOpenLocalLink"]>((target, action = "open_editor", editor) => {
+    if (projectId && opensInViewer(target.path, action) && !editor && target.trigger !== "contextmenu") {
+      const path = projectRelativePath(projectLocalPath, target.path)
+      if (path) {
+        openViewer({ kind: "file", projectId, path, ...(target.line ? { line: target.line } : {}) })
+        return Promise.resolve()
+      }
+    }
+    return state.handleOpenLocalLink(target, action, editor)
+  }, [projectId, projectLocalPath, state.handleOpenLocalLink])
+  // A file link inside the viewer (a markdown preview's) follows the same
+  // rule as one in the transcript.
+  const handleViewerLocalLink = useCallback((target: OpenLocalLinkTarget) => {
+    if (target.trigger === "contextmenu") return
+    void handleOpenLocalLink(target, shouldOpenLocalFileLinkInEditor(target.path) ? "open_editor" : "open_default")
+  }, [handleOpenLocalLink])
   const setRightSidebarSize = useRightSidebarStore((store) => store.setSize)
   const scrollback = useTerminalPreferencesStore((store) => store.scrollbackLines)
   const minColumnWidth = useTerminalPreferencesStore((store) => store.minColumnWidth)
@@ -556,6 +605,7 @@ export function ChatPage() {
   }, [state.chatSnapshot?.messages])
 
   const isMobileViewport = useIsMobileViewport()
+  const navigate = useNavigate()
   const terminalLayout = useMemo(() => {
     const mainSizes = getEffectiveTerminalMainSizes(storedTerminalLayout.mainSizes, isMobileViewport)
     return mainSizes === storedTerminalLayout.mainSizes ? storedTerminalLayout : { ...storedTerminalLayout, mainSizes }
@@ -563,9 +613,9 @@ export function ChatPage() {
   const hasTerminals = terminalLayout.terminals.length > 0
   const showTerminalPane = Boolean(projectId && terminalLayout.isVisible && hasTerminals)
   const shouldRenderTerminalLayout = Boolean(projectId && hasTerminals)
-  const activeRightPanel = projectId ? rightSidebarVisibility.rightPanel : "hidden"
-  const showRightSidebar = Boolean(projectId && activeRightPanel !== "hidden")
-  const showGitPanel = Boolean(projectId && activeRightPanel === "git")
+  const showRightSidebar = Boolean(projectId && widgetsOpen)
+  // Set by the new-chat auto-open below; the toggle animation consumes it.
+  const skipNextOpenAnimationRef = useRef(false)
   const shouldRenderRightSidebarLayout = Boolean(projectId)
   const shouldRenderDesktopRightSidebarLayout = shouldRenderRightSidebarLayout && !isMobileViewport
   const layoutWidth = useLayoutWidth(layoutRootRef)
@@ -602,6 +652,7 @@ export function ChatPage() {
     shouldRenderRightSidebarLayout: shouldRenderDesktopRightSidebarLayout,
     showRightSidebar,
     rightSidebarSizePercent: effectiveRightSidebarSize,
+    skipNextOpenAnimationRef,
   })
 
   const {
@@ -630,13 +681,15 @@ export function ChatPage() {
     handlePreviewMergeBranch,
     handleMergeBranch,
     handleCreateBranch,
+    handleReadCommit,
+    handleReadBranch,
   } = useChatPageSidebarActions({
     state,
     projectId,
-    showRightSidebar: showGitPanel,
+    showRightSidebar,
   })
 
-  const { typedEmptyStateText, isEmptyStateTypingComplete } = useEmptyStateTyping(showEmptyState, state.activeChatId)
+  const { typedEmptyStateText, isEmptyStateTypingComplete } = useEmptyStateTyping(showEmptyState)
 
   // Read off the sidebar snapshot rather than the git one: the sidebar carries
   // a resolved forge URL for every project, while `project-git` only knows a
@@ -655,6 +708,18 @@ export function ChatPage() {
     enabled: state.hasSelectedProject,
     canCancel: state.canCancel,
   })
+
+  // The chat is inert while the viewer is open, so the composer can't hold
+  // focus then, and a new chat's composer mounts (and tries to take focus)
+  // before the address change closes the viewer. Hand focus back on close.
+  const wasViewerOpenRef = useRef(viewerOpen)
+  useEffect(() => {
+    const wasViewerOpen = wasViewerOpenRef.current
+    wasViewerOpenRef.current = viewerOpen
+    if (wasViewerOpen && !viewerOpen) {
+      chatInputElementRef.current?.focus({ preventScroll: true })
+    }
+  }, [viewerOpen])
 
   const enqueueDroppedFiles = useCallback((files: File[]) => {
     if (!state.hasSelectedProject || files.length === 0) {
@@ -714,42 +779,42 @@ export function ChatPage() {
 
   const handleCloseRightSidebar = useCallback(() => {
     if (!projectId) return
-    hideRightPanel(projectId)
-  }, [hideRightPanel, projectId])
+    hideWidgets(projectId)
+  }, [hideWidgets, projectId])
 
-  const handleToggleGitPanel = useCallback(() => {
+  const handleToggleWidgets = useCallback(() => {
     if (!projectId) return
+    toggleWidgets(projectId)
+  }, [projectId, toggleWidgets])
 
-    if (activeRightPanel === "git") {
-      hideRightPanel(projectId)
-      return
-    }
+  const activeChatId = state.activeChatId
+  const handleJumpToToolCall = useCallback((toolId: string) => {
+    if (!activeChatId) return
+    // The same one-shot jump request the left sidebar's hover card sends,
+    // pointed at a tool call instead of a role.
+    navigate(`/chat/${activeChatId}`, { state: buildChatJumpLocationState({ toolId }) })
+    // On a phone the column is a sheet over the chat: close it so the jump
+    // lands somewhere visible.
+    if (isMobileViewport && projectId) hideWidgets(projectId)
+  }, [activeChatId, hideWidgets, isMobileViewport, navigate, projectId])
 
-    if (state.chatDiffSnapshot?.status === "no_repo") {
-      void (async () => {
-        const confirmed = await dialog.confirm({
-          title: "Initialize Git?",
-          description: "Initialize a local git repository in this project?",
-          confirmLabel: "Init Git",
-          cancelLabel: "Cancel",
-        })
-        if (!confirmed) return
+  // A new chat on desktop opens with the widgets already showing: no slide-in,
+  // since nobody asked for them, and a layout effect so the closed frame never
+  // paints. Keyed on the chat, so closing them on that page sticks until the
+  // next new chat.
+  const openWidgets = useRightSidebarStore((store) => store.openWidgets)
+  useLayoutEffect(() => {
+    if (!showEmptyState || isMobileViewport || !projectId) return
+    if (useRightSidebarStore.getState().projects[projectId]?.widgetsOpen) return
+    skipNextOpenAnimationRef.current = true
+    openWidgets(projectId)
+  }, [activeChatId, isMobileViewport, openWidgets, projectId, showEmptyState])
 
-        const result = await handleInitializeGit()
-        if (result?.ok) {
-          toggleRightPanel(projectId, "git")
-        }
-      })()
-      return
-    }
-
-    toggleRightPanel(projectId, "git")
-  }, [activeRightPanel, dialog, handleInitializeGit, hideRightPanel, projectId, state.chatDiffSnapshot?.status, toggleRightPanel])
-
-  const handleToggleBrowserPanel = useCallback(() => {
-    if (!projectId) return
-    toggleRightPanel(projectId, "browser")
-  }, [projectId, toggleRightPanel])
+  // On a phone the widget column is a sheet over the chat, and the viewer
+  // opens over the chat: close the sheet so what you opened is what you see.
+  useEffect(() => {
+    if (viewerOpen && isMobileViewport && projectId) hideWidgets(projectId)
+  }, [hideWidgets, isMobileViewport, projectId, viewerOpen])
 
   const handleRunQuickAction = useCallback((command: string) => {
     if (!projectId) return
@@ -907,7 +972,7 @@ export function ChatPage() {
 
       if (actionMatchesEvent(resolvedKeybindings, "toggleRightSidebar", event)) {
         event.preventDefault()
-        handleToggleGitPanel()
+        handleToggleWidgets()
         return
       }
 
@@ -931,7 +996,7 @@ export function ChatPage() {
 
     window.addEventListener("keydown", handleGlobalKeydown)
     return () => window.removeEventListener("keydown", handleGlobalKeydown)
-  }, [addTerminal, handleToggleEmbeddedTerminal, handleToggleGitPanel, projectId, resolvedKeybindings, state.handleOpenExternal])
+  }, [addTerminal, handleToggleEmbeddedTerminal, handleToggleWidgets, projectId, resolvedKeybindings, state.handleOpenExternal])
 
   // Re-checking "is the reader at the end" after a terminal toggle or a window
   // resize used to live here. The transcript observes its own element now, so
@@ -1009,9 +1074,8 @@ export function ChatPage() {
           localPath={state.navbarLocalPath}
           embeddedTerminalVisible={showTerminalPane}
           onToggleEmbeddedTerminal={projectId ? handleToggleEmbeddedTerminal : undefined}
-          rightPanel={activeRightPanel}
-          onToggleGitPanel={projectId ? handleToggleGitPanel : undefined}
-          onToggleBrowserPanel={projectId ? handleToggleBrowserPanel : undefined}
+          widgetsOpen={showRightSidebar}
+          onToggleWidgets={projectId ? handleToggleWidgets : undefined}
           onOpenExternal={handleOpenExternal}
           onExportTranscript={state.activeChatId ? handleExportTranscript : undefined}
           canExportTranscript={Boolean(state.activeChatId) && !state.isExportingStandalone}
@@ -1051,7 +1115,7 @@ export function ChatPage() {
           onStopDraining={state.handleStopDraining}
           onSteerQueuedMessage={state.handleSteerQueuedMessage}
           onRemoveQueuedMessage={state.handleRemoveQueuedMessage}
-          onOpenLocalLink={state.handleOpenLocalLink}
+          onOpenLocalLink={handleOpenLocalLink}
           editorPreset={editorPreset}
           editorCommandTemplate={editorCommandTemplate}
           platform={state.localProjects?.machine.platform}
@@ -1074,6 +1138,8 @@ export function ChatPage() {
           showEmptyState={showEmptyState}
           socket={state.socket}
           emptyStateProjectPath={state.navbarLocalPath}
+          emptyStateProjectId={projectId}
+          showEmptyStateUsage={isMobileViewport}
           onOpenProjectExternal={handleOpenExternal}
           scrollbarGutterHostRef={chatCardRef}
         />
@@ -1113,7 +1179,23 @@ export function ChatPage() {
     </Card>
   )
 
-  const workspace = projectId ? (
+  // What the viewer needs to show diffs: this project's changed files, and
+  // how to read, render and open them.
+  const diffViewerContext = useMemo<DiffViewerContext | undefined>(() => (projectId ? {
+    projectId,
+    files: state.chatDiffSnapshot?.files ?? EMPTY_DIFF_SNAPSHOT.files,
+    filesReady: state.chatDiffSnapshot?.status === "ready",
+    editorLabel: state.editorLabel,
+    diffRenderMode,
+    wrapLines: wrapDiffLines,
+    onDiffRenderModeChange: setDiffRenderMode,
+    onWrapLinesChange: setWrapDiffLines,
+    onLoadPatch: handleLoadDiffPatch,
+    onOpenFile: handleOpenDiffFile,
+    isMac: state.localProjects?.machine.platform === "darwin",
+  } : undefined), [diffRenderMode, handleLoadDiffPatch, handleOpenDiffFile, projectId, setDiffRenderMode, setWrapDiffLines, state.chatDiffSnapshot?.files, state.chatDiffSnapshot?.status, state.editorLabel, state.localProjects?.machine.platform, wrapDiffLines])
+
+  const chatWorkspace = projectId ? (
     <ChatWorkspace
       chatCard={chatCard}
       projectId={projectId}
@@ -1143,7 +1225,22 @@ export function ChatPage() {
     chatCard
   )
 
-  const gitPanelContentProps = useMemo<ComponentProps<typeof ChatSidebarContent> | null>(() => {
+  // The chat and its terminal, with the viewer over them when it's open. They
+  // stay mounted underneath (the transcript keeps its place, the terminals
+  // their sessions) but go inert: the viewer is the whole of what's
+  // interactive there, so Esc, typing and focus can't reach the chat behind.
+  const workspace = (
+    <div className="relative flex h-full min-h-0 flex-1 flex-col">
+      <div inert={viewerOpen || undefined} className="flex h-full min-h-0 flex-1 flex-col">
+        {chatWorkspace}
+      </div>
+      {/* No right padding beside the widget column: its own 8px gutter is
+          the gap, and the viewer's on top of it read as a double margin. */}
+      <ViewerLayer diff={diffViewerContext} onOpenLocalLink={handleViewerLocalLink} className={showRightSidebar && !isMobileViewport ? "pr-0" : undefined} />
+    </div>
+  )
+
+  const gitWidgetsProps = useMemo<ComponentProps<typeof GitWidgetsContent> | null>(() => {
     if (!projectId) {
       return null
     }
@@ -1152,8 +1249,6 @@ export function ChatPage() {
       projectId,
       diffs: state.chatDiffSnapshot ?? EMPTY_DIFF_SNAPSHOT,
       editorLabel: state.editorLabel,
-      diffRenderMode,
-      wrapLines: wrapDiffLines,
       onOpenFile: handleOpenDiffFile,
       onOpenInFinder: handleOpenDiffInFinder,
       onDiscardFile: handleDiscardDiffFile,
@@ -1161,7 +1256,6 @@ export function ChatPage() {
       onIgnoreFolder: handleIgnoreDiffFolder,
       onCopyFilePath: handleCopyDiffFilePath,
       onCopyRelativePath: handleCopyDiffRelativePath,
-      onLoadPatch: handleLoadDiffPatch,
       onListBranches: handleListBranches,
       onPreviewMergeBranch: handlePreviewMergeBranch,
       onMergeBranch: handleMergeBranch,
@@ -1174,19 +1268,20 @@ export function ChatPage() {
       onSetupGitHub: handleSetupGitHub,
       onCommit: handleCommitDiffs,
       onSyncWithRemote: handleSyncBranch,
-      onDiffRenderModeChange: setDiffRenderMode,
-      onWrapLinesChange: setWrapDiffLines,
-      onClose: handleCloseRightSidebar,
+      onReadCommit: handleReadCommit,
+      onReadBranch: handleReadBranch,
+      onLoadPatch: handleLoadDiffPatch,
     }
   }, [
-    diffRenderMode,
     handleCheckGitHubRepoAvailability,
     handleCheckoutBranch,
-    handleCloseRightSidebar,
     handleCommitDiffs,
     handleCopyDiffFilePath,
     handleCopyDiffRelativePath,
     handleCreateBranch,
+    handleReadCommit,
+    handleReadBranch,
+    handleLoadDiffPatch,
     handleDiscardDiffFile,
     handleGenerateCommitMessage,
     handleGetGitHubPublishInfo,
@@ -1194,7 +1289,6 @@ export function ChatPage() {
     handleIgnoreDiffFolder,
     handleInitializeGit,
     handleListBranches,
-    handleLoadDiffPatch,
     handleMergeBranch,
     handleOpenDiffFile,
     handleOpenDiffInFinder,
@@ -1202,21 +1296,29 @@ export function ChatPage() {
     handleSetupGitHub,
     handleSyncBranch,
     projectId,
-    setDiffRenderMode,
-    setWrapDiffLines,
     state.chatDiffSnapshot,
     state.editorLabel,
-    wrapDiffLines,
   ])
-  const rightPanelContent = activeRightPanel === "browser" && projectId
-    ? (
-      <Suspense fallback={<div className="h-full w-full" />}>
-        <BrowserPanel projectId={projectId} socket={state.socket} onClose={handleCloseRightSidebar} onRunQuickAction={handleRunQuickAction} />
-      </Suspense>
-    )
-    : gitPanelContentProps
-      ? <ChatSidebarContent {...gitPanelContentProps} />
-      : null
+  const rightPanelContent = projectId ? (
+    // The chat's payload store: an Agents card fetches a prompt the
+    // transcript left in the sidecar, as the chat's own rows do.
+    <ToolPayloadProvider store={toolPayloadStore}>
+    <WidgetsSidebar
+      projectId={projectId}
+      chatId={state.activeChatId}
+      activeProvider={state.runtime?.provider ?? null}
+      availableProviders={state.availableProviders}
+      socket={state.socket}
+      active={showRightSidebar}
+      entries={state.chatSnapshot?.messages ?? EMPTY_TRANSCRIPT_ENTRIES}
+      subagents={state.runtime?.subagents ?? EMPTY_SUBAGENTS}
+      onRunQuickAction={handleRunQuickAction}
+      onJumpToToolCall={handleJumpToToolCall}
+      gitWidgets={gitWidgetsProps ? <GitWidgetsContent {...gitWidgetsProps} /> : null}
+      isNewChat={showEmptyState}
+    />
+    </ToolPayloadProvider>
+  ) : null
 
   return (
     <div ref={layoutRootRef} className="flex-1 flex flex-col min-w-0 relative">

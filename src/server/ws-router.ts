@@ -4,6 +4,7 @@ import { homedir } from "node:os"
 import { PROTOCOL_VERSION } from "../shared/types"
 import type { ClientEnvelope, ServerEnvelope, SubscriptionTopic } from "../shared/protocol"
 import { isClientEnvelope } from "../shared/protocol"
+import { diffSidebarIndex, indexSidebarData, type SidebarIndex } from "../shared/sidebar-patch"
 import type { AgentCoordinator } from "./agent"
 import type { AnalyticsReporter } from "./analytics"
 import { NoopAnalyticsReporter } from "./analytics"
@@ -76,12 +77,17 @@ export interface ClientState {
   chatFollowing?: Map<string, boolean>
   chatWindowChecks?: Map<string, number>
   protectedDraftChatIds?: Set<string>
+  /**
+   * The sidebar snapshot each patch subscription last received, which the
+   * next patch is diffed against. Absent means the next push is a reset.
+   */
+  sidebarPatchBases?: Map<string, SidebarSnapshotEntry>
 }
 
 interface CreateWsRouterArgs {
   diagnostics?: PerformanceLog
   store: EventStore
-  diffStore: Pick<DiffStore, "getProjectSnapshot" | "getSnapshotVersion" | "refreshSnapshot" | "initializeGit" | "getGitHubPublishInfo" | "checkGitHubRepoAvailability" | "publishToGitHub" | "listBranches" | "previewMergeBranch" | "mergeBranch" | "syncBranch" | "checkoutBranch" | "createBranch" | "generateCommitMessage" | "commitFiles" | "discardFile" | "ignoreFile" | "readPatch">
+  diffStore: Pick<DiffStore, "getProjectSnapshot" | "getSnapshotVersion" | "refreshSnapshot" | "initializeGit" | "getGitHubPublishInfo" | "checkGitHubRepoAvailability" | "publishToGitHub" | "listBranches" | "previewMergeBranch" | "mergeBranch" | "syncBranch" | "checkoutBranch" | "createBranch" | "generateCommitMessage" | "commitFiles" | "discardFile" | "ignoreFile" | "readPatch" | "readCommit" | "readBranch">
   worktreeProbe: Pick<WorktreeProbe, "getStates" | "getRepoLabels" | "getProjectsWithoutRepo">
   agent: AgentCoordinator
   terminals: TerminalManager
@@ -129,11 +135,19 @@ interface SnapshotBroadcastFilter {
   terminalIds?: Set<string>
 }
 
+interface SidebarSnapshotEntry {
+  data: ReturnType<typeof deriveSidebarData>
+  signature: string
+  /** Moves exactly when `data` is re-derived; what patches name as from/to. */
+  revision: number
+  /** Built on the first patch that needs it; null when not patchable. */
+  patchIndex?: SidebarIndex | null
+  /** Serialized patches into this snapshot, by the revision they start from. */
+  patchJsonByBase?: Map<number, string>
+}
+
 interface SnapshotComputationCache {
-  sidebar?: {
-    data: ReturnType<typeof deriveSidebarData>
-    signature: string
-  }
+  sidebar?: SidebarSnapshotEntry
   /**
    * Derived chat snapshots keyed by chat, shared across sockets in one
    * broadcast.
@@ -321,7 +335,8 @@ export function createWsRouter({
    * input the sidebar derive reads, so the memo below is exact.
    */
   let sidebarInputsVersion = 0
-  let sidebarMemo: { key: string; entry: { data: ReturnType<typeof deriveSidebarData>; signature: string } } | null = null
+  let sidebarMemo: { key: string; entry: SidebarSnapshotEntry } | null = null
+  let sidebarRevision = 0
 
   /**
    * How often a sidebar that nothing else touched is re-derived, for the
@@ -381,12 +396,13 @@ export function createWsRouter({
       projectsWithoutRepo: worktreeProbe.getProjectsWithoutRepo(),
     })
 
-    const sidebar = {
+    const sidebar: SidebarSnapshotEntry = {
       data,
       signature: JSON.stringify({
         type: "sidebar" as const,
         data,
       }),
+      revision: ++sidebarRevision,
     }
     if (canMemo) sidebarMemo = { key: memoKey, entry: sidebar }
 
@@ -395,6 +411,40 @@ export function createWsRouter({
     }
 
     return sidebar
+  }
+
+  /**
+   * Answer a patch subscription with what changed since the snapshot it holds
+   * (see shared/sidebar-patch.ts). False when this snapshot can't be patched,
+   * and the caller sends it whole; the base is dropped so the next patch is a
+   * reset. The serialized patch is cached on the snapshot by base revision,
+   * so sockets at the same point share one diff and one stringify.
+   */
+  function sendSidebarPatch(ws: ServerWebSocket<ClientState>, id: string, sidebar: SidebarSnapshotEntry): boolean {
+    ws.data.sidebarPatchBases ??= new Map()
+    const bases = ws.data.sidebarPatchBases
+    const base = bases.get(id)
+    if (base === sidebar) return true
+
+    if (sidebar.patchIndex === undefined) sidebar.patchIndex = indexSidebarData(sidebar.data)
+    if (!sidebar.patchIndex) {
+      bases.delete(id)
+      return false
+    }
+    if (base && base.patchIndex === undefined) base.patchIndex = indexSidebarData(base.data)
+    const from = base?.patchIndex ? base.revision : null
+
+    sidebar.patchJsonByBase ??= new Map()
+    let json = sidebar.patchJsonByBase.get(from ?? -1)
+    if (json === undefined) {
+      const patch = diffSidebarIndex(from === null ? null : base!.patchIndex!, sidebar.patchIndex, from, sidebar.revision)
+      json = JSON.stringify({ type: "sidebar-patch", data: patch })
+      sidebar.patchJsonByBase.set(from ?? -1, json)
+    }
+    bases.set(id, sidebar)
+    ensureSnapshotSignatures(ws).delete(id)
+    sendSerializedSnapshot(ws, id, json)
+    return true
   }
 
   function getProjectGitSignature(projectId: string): string {
@@ -542,7 +592,8 @@ export function createWsRouter({
           agent.getActiveStatuses(),
           agent.getDrainingChatIds(),
           topic.chatId,
-          (chatId) => store.getClientTranscript(chatId)
+          (chatId) => store.getClientTranscript(chatId),
+          agent.getSubagents?.(topic.chatId)
         ),
       },
     }
@@ -576,7 +627,8 @@ export function createWsRouter({
       agent.getActiveStatuses(),
       agent.getDrainingChatIds(),
       chatId,
-      (id) => store.getClientTranscript(id, fromIndex ?? getEarliestChatWindowStart(id))
+      (id) => store.getClientTranscript(id, fromIndex ?? getEarliestChatWindowStart(id)),
+      agent.getSubagents?.(chatId)
     )
     if (cache) {
       (cache.chat ??= new Map()).set(key, data)
@@ -716,6 +768,7 @@ export function createWsRouter({
       // socket, and changed ones are stringified exactly once.
       if (topic.type === "sidebar") {
         const sidebar = getSidebarSnapshotCacheEntry(options?.cache)
+        if (topic.patches && sendSidebarPatch(ws, id, sidebar)) continue
         if (snapshotSignatures.get(id) === sidebar.signature) {
           continue
         }
@@ -1425,6 +1478,31 @@ export function createWsRouter({
           const result = await diffStore.readPatch({
             projectPath: project.localPath,
             path: command.path,
+            fullContext: command.fullContext === true,
+          })
+          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
+          return
+        }
+        case "project.readBranch": {
+          const project = store.getProject(command.projectId)
+          if (!project) {
+            throw new Error("Project not found")
+          }
+          const result = await diffStore.readBranch({
+            projectPath: project.localPath,
+            branch: command.branch,
+          })
+          send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
+          return
+        }
+        case "project.readCommit": {
+          const project = store.getProject(command.projectId)
+          if (!project) {
+            throw new Error("Project not found")
+          }
+          const result = await diffStore.readCommit({
+            projectPath: project.localPath,
+            sha: command.sha,
           })
           send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result })
           return
@@ -1797,6 +1875,7 @@ export function createWsRouter({
             title: chat.title,
             localPath: project.localPath,
             theme: command.theme,
+            sourceOrigin: command.sourceOrigin,
             attachmentMode: command.attachmentMode,
             messages: store.getMessages(command.chatId),
             resolveMediaPath: (url) => store.resolveTranscriptMediaPath(url),
@@ -1908,6 +1987,7 @@ export function createWsRouter({
       ws.data.chatWindowStarts?.clear()
       ws.data.chatFollowing?.clear()
       ws.data.chatWindowChecks?.clear()
+      ws.data.sidebarPatchBases?.clear()
     },
     broadcastSnapshots,
     broadcastChatStateImmediately,
@@ -1947,6 +2027,7 @@ export function createWsRouter({
         ws.data.chatProvidersSent?.delete(parsed.id)
         ws.data.chatFollowing?.delete(parsed.id)
         ws.data.chatWindowChecks?.delete(parsed.id)
+        ws.data.sidebarPatchBases?.delete(parsed.id)
         if (parsed.topic.type === "chat" && store.prepareTranscript && store.getChat(parsed.topic.chatId)) {
           try {
             await store.prepareTranscript(parsed.topic.chatId)
@@ -2000,6 +2081,7 @@ export function createWsRouter({
         ws.data.chatProvidersSent?.delete(parsed.id)
         ws.data.chatFollowing?.delete(parsed.id)
         ws.data.chatWindowChecks?.delete(parsed.id)
+        ws.data.sidebarPatchBases?.delete(parsed.id)
         send(ws, { v: PROTOCOL_VERSION, type: "ack", id: parsed.id })
         return
       }

@@ -34,8 +34,8 @@ import { ChatPreferenceControls } from "./ChatPreferenceControls"
 import { ContextWindowMeter } from "./ContextWindowMeter"
 import { UsageLimitRings, useUsageLimitRingsVisible } from "./UsageLimitRings"
 import { AttachmentFileCard, AttachmentImageCard } from "../messages/AttachmentCard"
-import { AttachmentPreviewModal } from "../messages/AttachmentPreviewModal"
 import { classifyAttachmentPreview } from "../messages/attachmentPreview"
+import { openViewer, useViewerStore, viewerAttachmentFromChat } from "../../stores/viewerStore"
 import { overrideContextWindowMaxTokens, type ContextWindowSnapshot } from "../../lib/contextWindow"
 import {
   applySkillCompletion,
@@ -44,6 +44,16 @@ import {
   filterSkillMenuItems,
   getActiveSlashQuery,
 } from "../../lib/skill-menu"
+import {
+  applyProjectMention,
+  filterProjectMentionItems,
+  getActiveProjectMention,
+  projectMentionCandidates,
+  type ProjectMentionItem,
+} from "../../lib/project-mention"
+import { useSidebarStore } from "../../stores/sidebarStore"
+
+/** Stable default, so a chat with no delegated work doesn't re-render on it. */
 
 const MAX_FILES_PER_DROP = 50
 const MAX_CONCURRENT_UPLOADS = 3
@@ -269,7 +279,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   // net inset the old wrapper produced (20px padding + 12px spacer).
   const controlsScrollSpacer = cn("min-w-3", isStandalone && "min-w-8")
   const [attachments, setAttachments] = useState<ComposerAttachment[]>(() => hydrateComposerAttachments(chatId ? getAttachmentDrafts(chatId) : []))
-  const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null)
   const [uploadError, setUploadError] = useState<UploadErrorReport | null>(null)
   const uploadQueueRef = useRef<File[]>([])
   const activeUploadsRef = useRef(0)
@@ -288,6 +297,10 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const [skillMenuOffset, setSkillMenuOffset] = useState(0)
   const skillsFetchRef = useRef<{ provider: AgentProvider | null; pending: boolean }>({ provider: null, pending: false })
   const selectedSkillItemRef = useRef<HTMLButtonElement | null>(null)
+  // "@" project menu state, the same shape as the skill menu's.
+  const [projectMenuDismissed, setProjectMenuDismissed] = useState(false)
+  const [projectMenuOffset, setProjectMenuOffset] = useState(0)
+  const selectedProjectItemRef = useRef<HTMLButtonElement | null>(null)
 
   // The label goes into a textarea placeholder, which browsers do not clip
   // or ellipsize the way a span would: a long path runs past the pill. Keep
@@ -382,6 +395,52 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     })
   }, [value, chatId, setDraft])
 
+  // "@" project menu derivations. The project list is read from the store
+  // when the menu opens rather than subscribed to: the sidebar changes on
+  // every chat update, and a subscription would re-render the composer each time.
+  const projectMention = !disabled ? getActiveProjectMention(value, caretPosition) : null
+  const projectMentionActive = projectMention !== null
+  const projectMentionCandidateList = useMemo(
+    () => (projectMentionActive ? projectMentionCandidates(useSidebarStore.getState().data.projectGroups, projectPath ?? null) : []),
+    [projectMentionActive, projectPath]
+  )
+  const projectMenuItems = useMemo(
+    () => (projectMention ? filterProjectMentionItems(projectMentionCandidateList, projectMention.query) : []),
+    [projectMention?.query, projectMentionCandidateList]
+  )
+  const projectMenuOpen = projectMentionActive && !projectMenuDismissed && projectMenuItems.length > 0
+  const selectedProjectIndex = projectMenuItems.length > 0
+    ? projectMenuItems.length - 1 - Math.min(projectMenuOffset, projectMenuItems.length - 1)
+    : -1
+
+  useEffect(() => {
+    if (!projectMentionActive) setProjectMenuDismissed(false)
+  }, [projectMentionActive])
+
+  useEffect(() => {
+    setProjectMenuOffset(0)
+  }, [projectMention?.query])
+
+  useEffect(() => {
+    selectedProjectItemRef.current?.scrollIntoView({ block: "nearest" })
+  }, [selectedProjectIndex, projectMenuOpen])
+
+  const acceptProject = useCallback((project: ProjectMentionItem) => {
+    const mention = getActiveProjectMention(value, caretPosition)
+    if (!mention) return
+    const next = applyProjectMention(value, mention, project.localPath)
+    setValue(next.value)
+    if (chatId) setDraft(chatId, next.value)
+    setCaretPosition(next.caret)
+    requestAnimationFrame(() => {
+      const element = textareaRef.current
+      if (!element) return
+      element.focus()
+      element.selectionStart = next.caret
+      element.selectionEnd = next.caret
+    })
+  }, [value, caretPosition, chatId, setDraft])
+
   const uploadedAttachments = attachments.filter((attachment) => attachment.status === "uploaded")
   const hasPendingUploads = attachments.some((attachment) => attachment.status === "uploading")
   const canSubmit = value.trim().length > 0 || uploadedAttachments.length > 0
@@ -396,7 +455,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     if (left.kind === right.kind) return 0
     return left.kind === "image" ? -1 : 1
   })
-  const selectedAttachment = attachments.find((attachment) => attachment.id === selectedAttachmentId) ?? null
 
   const cleanupAttachmentPreview = useCallback((attachment: ComposerAttachment) => {
     if (attachment.previewUrl) {
@@ -416,7 +474,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     })
     uploadQueueRef.current = []
     activeUploadsRef.current = 0
-    setSelectedAttachmentId(null)
     setUploadError(null)
   }, [cleanupAttachmentPreview])
 
@@ -494,7 +551,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
     uploadQueueRef.current = []
     activeUploadsRef.current = 0
     removedAttachmentIdsRef.current.clear()
-    setSelectedAttachmentId(null)
     setUploadError(null)
     setAttachments((current) => {
       current.forEach(cleanupAttachmentPreview)
@@ -704,6 +760,8 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       modelOptions = { claude: { ...providerPrefs.modelOptions } }
     } else if (providerPrefs.provider === "cursor") {
       modelOptions = { cursor: { ...providerPrefs.modelOptions } }
+    } else if (providerPrefs.provider === "grok") {
+      modelOptions = { grok: { ...providerPrefs.modelOptions } }
     } else if (providerPrefs.provider === "pi") {
       modelOptions = { pi: { ...providerPrefs.modelOptions } }
     } else {
@@ -725,7 +783,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
 
     const nextValue = value
     const previousAttachments = attachmentsRef.current
-    const previousSelectedAttachmentId = selectedAttachmentId
     const previousUploadError = uploadError
     const attachmentsForSubmit = uploadedAttachments.map(({ previewUrl: _previewUrl, status: _status, ...attachment }) => attachment)
     const submitOptions = buildSubmitOptions(
@@ -748,7 +805,6 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       setValue(nextValue)
       if (chatId) setDraft(chatId, nextValue)
       setAttachments(previousAttachments)
-      setSelectedAttachmentId(previousSelectedAttachmentId)
       setUploadError(previousUploadError)
     }
   }
@@ -817,6 +873,32 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (event.key === "Escape") {
         event.preventDefault()
         setSkillMenuDismissed(true)
+        return
+      }
+    }
+
+    if (projectMenuOpen) {
+      if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault()
+        setProjectMenuOffset((offset) => Math.min(offset + 1, projectMenuItems.length - 1))
+        return
+      }
+      if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault()
+        setProjectMenuOffset((offset) => Math.max(offset - 1, 0))
+        return
+      }
+      if ((event.key === "Enter" || event.key === "Tab") && !event.shiftKey) {
+        const selected = projectMenuItems[selectedProjectIndex]
+        if (selected) {
+          event.preventDefault()
+          acceptProject(selected)
+          return
+        }
+      }
+      if (event.key === "Escape") {
+        event.preventDefault()
+        setProjectMenuDismissed(true)
         return
       }
     }
@@ -900,7 +982,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       return
     }
 
-    setSelectedAttachmentId(attachment.id)
+    openViewer({ kind: "attachment", attachment: viewerAttachmentFromChat(attachment) })
   }
 
   function removeAttachment(attachment: ComposerAttachment) {
@@ -910,8 +992,10 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (removed) cleanupAttachmentPreview(removed)
       return current.filter((item) => item.id !== attachment.id)
     })
-    if (selectedAttachmentId === attachment.id) {
-      setSelectedAttachmentId(null)
+    // Removed while it's open in the viewer: its URL is about to go away.
+    const viewing = useViewerStore.getState().item
+    if (viewing?.kind === "attachment" && viewing.attachment.url === attachment.contentUrl) {
+      useViewerStore.getState().close()
     }
 
     if (attachment.status === "uploaded") {
@@ -955,6 +1039,36 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   {skill.description ? (
                     <span className="min-w-0 truncate text-xs text-muted-foreground">{skill.description}</span>
                   ) : null}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          {projectMenuOpen ? (
+            <div
+              className="absolute bottom-full left-0 right-0 mb-2 z-30 max-h-64 overflow-y-auto rounded-2xl border border-border bg-popover/95 backdrop-blur-lg shadow-lg py-1"
+              role="listbox"
+              aria-label="Projects"
+            >
+              {projectMenuItems.map((project, index) => (
+                <button
+                  key={project.projectId}
+                  ref={index === selectedProjectIndex ? selectedProjectItemRef : undefined}
+                  type="button"
+                  role="option"
+                  aria-selected={index === selectedProjectIndex}
+                  className={cn(
+                    "flex w-full items-baseline gap-2 px-3 py-1.5 text-left text-sm",
+                    index === selectedProjectIndex ? "bg-accent text-accent-foreground" : "text-foreground"
+                  )}
+                  onMouseEnter={() => setProjectMenuOffset(projectMenuItems.length - 1 - index)}
+                  onMouseDown={(event) => {
+                    // mousedown (not click) so the textarea never loses focus.
+                    event.preventDefault()
+                    acceptProject(project)
+                  }}
+                >
+                  <span className="shrink-0 text-[13px]">@{project.title}</span>
+                  <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">{formatPathWithTilde(project.localPath)}</span>
                 </button>
               ))}
             </div>
@@ -1194,7 +1308,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
             className="max-w-[840px] mx-auto"
           />
           {activeContextWindow || showUsageLimitRings ? (
-            <div className="flex items-center gap-1 md:hidden mx-[13px]">
+            <div className="mx-[13px] flex items-center gap-2 md:hidden">
               {activeContextWindow ? <ContextWindowMeter usage={activeContextWindow} /> : null}
               {showUsageLimitRings ? <UsageLimitRings provider={selectedProvider} model={providerPrefs.model} /> : null}
             </div>
@@ -1202,15 +1316,24 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
           <div className={controlsScrollSpacer} />
         </div>
 
+        {/* right-[17px] is where the dial has always sat: right-[29px]
+            pulled back by translate-x-1/2 of its own 24px. */}
         {activeContextWindow || showUsageLimitRings ? (
-          <div className="absolute right-[17px] top-1/2 -translate-y-1/2 hidden md:flex items-center gap-1">
+          <div className={cn(
+            "absolute inset-y-0 right-[17px] hidden items-center gap-2 md:flex",
+            // Mirror the parent's own padding so this spans its *content* box.
+            // top-1/2 centred on the padded box instead, and the padding is
+            // asymmetric when standalone (pt-3 pb-5) - which put the dial 4px
+            // below the controls it sits beside. Matching the padding centres
+            // on the row itself, in both modes.
+            isStandalone ? "pt-3 pb-5" : "py-3"
+          )}>
             {activeContextWindow ? <ContextWindowMeter usage={activeContextWindow} /> : null}
             {showUsageLimitRings ? <UsageLimitRings provider={selectedProvider} model={providerPrefs.model} /> : null}
           </div>
         ) : null}
       </div>
 
-      <AttachmentPreviewModal attachment={selectedAttachment} onOpenChange={(open) => !open && setSelectedAttachmentId(null)} />
       <SignInDialog
         provider={pendingSignInProvider}
         onOpenChange={(open) => {
