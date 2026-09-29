@@ -924,6 +924,7 @@ export function createDemoAppSettings(theme: AppThemePreference): AppSettingsSna
     submitWhileRunning: "queue",
     providerDefaults: createDefaultProviderDefaults(),
     newSidebarEnabled: true,
+    usageLimitIndicatorsEnabled: true,
     newProjectsDirectory: "~/Kanna",
     // Setup is marked done so the onboarding wizard never opens over the demo.
     setupShown: true,
