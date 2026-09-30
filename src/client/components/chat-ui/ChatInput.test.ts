@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import { createElement } from "react"
 import { renderToStaticMarkup } from "react-dom/server"
+import { MemoryRouter } from "react-router-dom"
 import { PROVIDERS } from "../../../shared/types"
+import { TooltipProvider } from "../ui/tooltip"
 import { ChatInput, getClipboardImageFiles, trimTrailingPastedNewlines, willExceedAttachmentLimit } from "./ChatInput"
 
 function createClipboardItem(args: {
@@ -122,14 +124,22 @@ describe("trimTrailingPastedNewlines", () => {
 })
 
 describe("ChatInput", () => {
-  test("renders a native attachment picker before the composer on phones and tablets", () => {
-    const html = renderToStaticMarkup(createElement(ChatInput, {
-      onSubmit: async () => undefined,
-      disabled: false,
-      canCancel: false,
-      activeProvider: null,
-      availableProviders: PROVIDERS,
-    }))
+  test("renders the mobile attachment trigger as a native file input target in the controls row", () => {
+    const html = renderToStaticMarkup(createElement(
+      MemoryRouter,
+      null,
+      createElement(
+        TooltipProvider,
+        null,
+        createElement(ChatInput, {
+          onSubmit: async () => undefined,
+          disabled: false,
+          canCancel: false,
+          activeProvider: null,
+          availableProviders: PROVIDERS,
+        }),
+      ),
+    ))
 
     expect(html).toContain('aria-label="Add files or photos"')
     expect(html.match(/type="file"/g)).toHaveLength(1)
