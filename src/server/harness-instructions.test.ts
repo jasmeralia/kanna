@@ -11,6 +11,15 @@ describe("buildKannaSystemInstructions", () => {
     expect(instructions).toContain(buildKannaAgentTrailer(AGENT_ID))
     expect(instructions).toContain(KANNA_CHAT_LINK_INSTRUCTIONS)
   })
+
+  test("routes blocking clarifications through the structured question flow in every mode", () => {
+    const instructions = buildKannaSystemInstructions(AGENT_ID)
+    expect(instructions).toContain("blocks meaningful progress")
+    expect(instructions).toContain("AskUserQuestion tool")
+    expect(instructions).toContain("Wait for the tool result")
+    expect(instructions).toContain("normal mode as well as plan mode")
+    expect(instructions).toContain("non-blocking questions in ordinary conversation")
+  })
 })
 
 describe("buildKannaSystemMessage", () => {
