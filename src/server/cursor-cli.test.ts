@@ -99,6 +99,42 @@ describe("parseCursorLine", () => {
     })
   })
 
+  test("normalizes native AskQuestion and drops Cursor's auto-rejected interaction query", () => {
+    const request = `{"type":"interaction_query","subtype":"request","query_type":"askQuestionInteractionQuery","query":{"id":0,"askQuestionInteractionQuery":{"args":{"title":"Language preference","questions":[{"id":"script_language","prompt":"Which language do you prefer for the new script?","options":[{"id":"typescript","label":"TypeScript (Recommended)"},{"id":"python","label":"Python"}],"allowMultiple":false}],"runAsync":false,"asyncOriginalToolCallId":""},"toolCallId":"tool-ask-1"}}}`
+    const response = `{"type":"interaction_query","subtype":"response","query_type":"askQuestionInteractionQuery","response":{"id":0,"askQuestionInteractionResponse":{"result":{"rejected":{"reason":"Questions skipped by the user, continue with the information you already have"}}}}}`
+    const started = `{"type":"tool_call","subtype":"started","call_id":"tool-ask-1","tool_call":{"askQuestionToolCall":{"args":{"title":"Language preference","questions":[{"id":"script_language","prompt":"Which language do you prefer for the new script?","options":[{"id":"typescript","label":"TypeScript (Recommended)"},{"id":"python","label":"Python"}],"allowMultiple":false}],"runAsync":false,"asyncOriginalToolCallId":""}},"toolCallId":"tool-ask-1"}}`
+    const completed = `{"type":"tool_call","subtype":"completed","call_id":"tool-ask-1","tool_call":{"askQuestionToolCall":{"args":{"title":"Language preference","questions":[{"id":"script_language","prompt":"Which language do you prefer for the new script?","options":[{"id":"typescript","label":"TypeScript (Recommended)"},{"id":"python","label":"Python"}],"allowMultiple":false}],"runAsync":false,"asyncOriginalToolCallId":""},"result":{"rejected":{"reason":"Questions skipped by the user, continue with the information you already have"}}},"toolCallId":"tool-ask-1"}}`
+    expect(parseCursorLine(request, "composer-2.5")).toEqual([])
+    expect(parseCursorLine(response, "composer-2.5")).toEqual([])
+    expect(firstEntry(started)).toMatchObject({
+      kind: "tool_call",
+      tool: {
+        toolKind: "ask_user_question",
+        input: {
+          questions: [{
+            id: "script_language",
+            question: "Which language do you prefer for the new script?",
+            options: [{ label: "TypeScript (Recommended)" }, { label: "Python" }],
+          }],
+        },
+      },
+    })
+    expect(firstEntry(completed)).toMatchObject({
+      kind: "tool_result",
+      toolId: "tool-ask-1",
+      content: { discarded: true, answers: {} },
+      isError: false,
+    })
+  })
+
+  test("maps native AskQuestion multiple choice and option id fallbacks", () => {
+    const line = `{"type":"tool_call","subtype":"started","call_id":"ask-multi","tool_call":{"askQuestionToolCall":{"args":{"questions":[{"prompt":"Pick any","allowMultiple":true,"options":[{"id":"one"},{"id":"two","label":"Two"}]}]}}}}`
+    expect(firstEntry(line)).toMatchObject({
+      kind: "tool_call",
+      tool: { toolKind: "ask_user_question", input: { questions: [{ question: "Pick any", multiSelect: true, options: [{ label: "one" }, { label: "Two" }] }] } },
+    })
+  })
+
   test("a failed tool call is flagged as an error result", () => {
     const line = `{"type":"tool_call","subtype":"completed","call_id":"c-9","tool_call":{"shellToolCall":{"args":{"command":"nope"},"result":{"error":{"message":"boom"}}}},"session_id":"s"}`
     expect(firstEntry(line)).toMatchObject({ kind: "tool_result", toolId: "c-9", isError: true })

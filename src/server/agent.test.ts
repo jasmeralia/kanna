@@ -23,6 +23,7 @@ import type { SessionArtifactStatus } from "./session-artifacts"
 import { timestamped } from "./transcript"
 import { KANNA_CHAT_LINK_NOTICE } from "../shared/chat-links"
 import { resetServerProvidersForTests } from "./provider-catalog"
+import { createAskUserQuestionTool, CURSOR_ASK_USER_QUESTION_SYSTEM_MESSAGE } from "./kanna-ask-tools"
 
 const withChatLinks = (text: string) => text + "\n\n" + KANNA_CHAT_LINK_NOTICE
 
@@ -2955,6 +2956,136 @@ describe("shared display tool lifecycle", () => {
       }
     })
   }
+})
+
+describe("Cursor AskUserQuestion lifecycle", () => {
+  function fixture() {
+    const store = createFakeStore()
+    const firstEvents = new AsyncEventQueue<any>()
+    let toolHost: import("./kanna-tools").KannaToolHost | undefined
+    const cursorTurns: Array<{ content: string; sessionToken?: string | null }> = []
+    const cursorManager = {
+      async startTurn(args: { content: string; customTools?: import("./kanna-tools").KannaToolHost; sessionToken?: string | null }): Promise<HarnessTurn> {
+        cursorTurns.push({ content: args.content, sessionToken: args.sessionToken })
+        if (args.customTools) toolHost = args.customTools
+        if (cursorTurns.length > 1) {
+          async function* followUp() {
+            yield { type: "transcript" as const, entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "follow-up done" }) }
+          }
+          return { provider: "cursor", stream: followUp(), interrupt: async () => {}, close: () => {} }
+        }
+        return { provider: "cursor", stream: firstEvents, interrupt: async () => { firstEvents.close() }, close: () => { firstEvents.close() } }
+      },
+    }
+    const coordinator = new AgentCoordinator({
+      store: store as never,
+      onStateChange: () => {},
+      cursorManager: cursorManager as never,
+      // Leave enough room for the test runner's polling under full-suite load.
+      kannaToolDefinitions: [createAskUserQuestionTool(200)],
+    })
+    return { store, coordinator, firstEvents, cursorTurns, getHost: () => toolHost }
+  }
+
+  const questions = [{ id: "color", question: "Which color?", options: [{ label: "Red" }, { label: "Blue" }] }]
+
+  test("answers within the budget inline and does not start a follow-up", async () => {
+    const { coordinator, getHost, store, firstEvents, cursorTurns } = fixture()
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "cursor", content: "Ask me", model: "composer-2.5" })
+    const host = getHost()!
+    const call = host.execute("ask_user_question", { questions })
+    await waitFor(() => coordinator.getPendingTool("chat-1") !== null)
+    const pending = coordinator.getPendingTool("chat-1")!
+    await coordinator.respondTool({ type: "chat.respondTool", chatId: "chat-1", toolUseId: pending.toolUseId, result: { answers: { color: ["Blue"] } } })
+    expect(await call).toMatchObject({ structuredContent: { answers: { color: ["Blue"] } } })
+    expect(store.messages.filter((entry) => entry.kind === "tool_call")).toHaveLength(1)
+    expect(store.messages.filter((entry) => entry.kind === "tool_result")).toHaveLength(1)
+    firstEvents.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "answered inline" }) })
+    firstEvents.close()
+    await waitFor(() => store.turnFinishedCount === 1)
+    expect(cursorTurns).toHaveLength(1)
+  })
+
+  test("holds a successful result while parked, then resumes with the answer", async () => {
+    const { coordinator, getHost, store, firstEvents, cursorTurns } = fixture()
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "cursor", content: "Ask me", model: "composer-2.5" })
+    const pendingCall = getHost()!.execute("ask_user_question", { questions })
+    await waitFor(() => coordinator.getPendingTool("chat-1") !== null)
+    await pendingCall
+    firstEvents.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "question posted" }) })
+    firstEvents.close()
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === "waiting_for_user")
+    // Let the stream consumer process the terminal result and reach its parked wait.
+    await Bun.sleep(30)
+    expect(store.messages.some((entry) => entry.kind === "result")).toBe(false)
+    const pending = coordinator.getPendingTool("chat-1")!
+    await coordinator.respondTool({ type: "chat.respondTool", chatId: "chat-1", toolUseId: pending.toolUseId, result: { answers: { color: ["Red"] } } })
+    await waitFor(() => cursorTurns.length === 2)
+    await waitFor(() => store.turnFinishedCount === 1)
+    expect(store.messages.filter((entry) => entry.kind === "tool_result")).toHaveLength(1)
+    expect(store.messages.find((entry) => entry.kind === "tool_result")).toMatchObject({ content: { answers: { color: ["Red"] } } })
+    expect(store.messages.some((entry) => entry.kind === "user_prompt" && (entry as any).content === "Here are my answers to your questions:" )).toBe(false)
+    expect(cursorTurns[1]?.content).toContain("Here are my answers to your questions:")
+    expect(cursorTurns[1]?.content).toContain(CURSOR_ASK_USER_QUESTION_SYSTEM_MESSAGE)
+  })
+
+  test("an answer during the still-running Cursor turn keeps its result and follows up after stream close", async () => {
+    const { coordinator, getHost, store, firstEvents, cursorTurns } = fixture()
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "cursor", content: "Ask me", model: "composer-2.5" })
+    const pendingCall = getHost()!.execute("ask_user_question", { questions })
+    await waitFor(() => coordinator.getPendingTool("chat-1") !== null)
+    await pendingCall
+    const pending = coordinator.getPendingTool("chat-1")!
+    await coordinator.respondTool({ type: "chat.respondTool", chatId: "chat-1", toolUseId: pending.toolUseId, result: { answers: { color: ["Blue"] } } })
+    firstEvents.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "success", isError: false, durationMs: 0, result: "original turn complete" }) })
+    firstEvents.close()
+    await waitFor(() => cursorTurns.length === 2)
+    await waitFor(() => store.turnFinishedCount === 2)
+    expect(store.messages.filter((entry) => entry.kind === "result")).toHaveLength(2)
+    expect(cursorTurns[1]?.content).toContain("Blue")
+  })
+
+  test("discards a parked question after an error result", async () => {
+    const { coordinator, getHost, store, firstEvents, cursorTurns } = fixture()
+    store.recordTurnFailed = async () => undefined as never
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "cursor", content: "Ask me", model: "composer-2.5" })
+    const pendingCall = getHost()!.execute("ask_user_question", { questions })
+    await waitFor(() => coordinator.getPendingTool("chat-1") !== null)
+    await pendingCall
+    firstEvents.push({ type: "transcript", entry: timestamped({ kind: "result", subtype: "error", isError: true, durationMs: 0, result: "Cursor failed" }) })
+    firstEvents.close()
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === undefined)
+    expect(store.messages.filter((entry) => entry.kind === "tool_result")).toHaveLength(1)
+    expect(store.messages.find((entry) => entry.kind === "tool_result")).toMatchObject({ content: { discarded: true } })
+    expect(cursorTurns).toHaveLength(1)
+  })
+
+  test("shutdown discards a parked question without marking it for resume", async () => {
+    const { coordinator, getHost, store } = fixture()
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "cursor", content: "Ask me", model: "composer-2.5" })
+    const pendingCall = getHost()!.execute("ask_user_question", { questions })
+    await waitFor(() => coordinator.getPendingTool("chat-1") !== null)
+    await pendingCall
+    await coordinator.interruptForShutdown()
+    expect(store.chat.resumePending).not.toBe(true)
+    expect(store.messages.filter((entry) => entry.kind === "tool_result")).toHaveLength(1)
+    expect(store.messages.find((entry) => entry.kind === "tool_result")).toMatchObject({ content: { discarded: true } })
+  })
+
+  test("cancelling a parked question writes one discarded result and starts no follow-up", async () => {
+    const { coordinator, getHost, store, cursorTurns } = fixture()
+    await coordinator.send({ type: "chat.send", chatId: "chat-1", provider: "cursor", content: "Ask me", model: "composer-2.5" })
+    const pendingCall = getHost()!.execute("ask_user_question", { questions })
+    await waitFor(() => coordinator.getPendingTool("chat-1") !== null)
+    await pendingCall
+    const pending = coordinator.getPendingTool("chat-1")!
+    await coordinator.cancel("chat-1")
+    await waitFor(() => coordinator.getActiveStatuses().get("chat-1") === undefined)
+    expect(store.messages.filter((entry) => entry.kind === "tool_result")).toHaveLength(1)
+    expect(store.messages.find((entry) => entry.kind === "tool_result")).toMatchObject({ content: { discarded: true } })
+    expect(cursorTurns).toHaveLength(1)
+    expect(pending.toolUseId).toBeDefined()
+  })
 })
 
 describe("subagent activity", () => {

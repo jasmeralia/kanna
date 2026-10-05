@@ -119,13 +119,41 @@ export function normalizeCursorUsage(value: unknown): ContextWindowUsageSnapshot
  * argument keys that `normalizeToolCall` understands, so tools render natively
  * in the UI. Unknown tools fall through to `unknown_tool`.
  */
+function normalizeCursorToolName(rawName: string) {
+  return rawName.toLowerCase().replace(/[^a-z]/g, "")
+}
+
+function translateCursorQuestions(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value.map((rawQuestion) => {
+    const question = asRecord(rawQuestion) ?? {}
+    const id = typeof question.id === "string" ? question.id : undefined
+    const options = Array.isArray(question.options)
+      ? question.options.flatMap((rawOption) => {
+          const option = asRecord(rawOption)
+          if (!option) return []
+          const label = asString(option.label) ?? asString(option.id)
+          return label === undefined ? [] : [{ label }]
+        })
+      : []
+    return {
+      ...(id ? { id } : {}),
+      question: asString(question.prompt) ?? "",
+      ...(options.length > 0 ? { options } : {}),
+      ...(question.allowMultiple === true ? { multiSelect: true } : {}),
+    }
+  })
+}
+
 function translateCursorTool(
   rawName: string,
   args: Record<string, unknown>
 ): { toolName: string; input: Record<string, unknown> } {
   // Tool keys and argument names are taken from observed `cursor-agent` stream
   // output. Anything unmapped falls through to `unknown_tool`, which still renders.
-  switch (rawName.toLowerCase().replace(/[^a-z]/g, "")) {
+  switch (normalizeCursorToolName(rawName)) {
+    case "askquestion":
+      return { toolName: "AskUserQuestion", input: { questions: translateCursorQuestions(args.questions) } }
     case "shell":
       return { toolName: "Bash", input: { command: args.command ?? "", description: args.description } }
     case "read":
@@ -206,6 +234,11 @@ export function parseCursorLine(line: string, configuredModel: string): HarnessE
   const debugRaw = trimmed
 
   switch (type) {
+    // Cursor emits this request and its auto-rejection for its built-in
+    // AskQuestion. The tool_call events below contain the renderable data.
+    case "interaction_query":
+      return []
+
     case "system": {
       if (asString(value.subtype) !== "init") return []
       const events: HarnessEvent[] = []
@@ -252,6 +285,20 @@ export function parseCursorLine(line: string, configuredModel: string): HarnessE
       }
 
       if (subtype === "completed") {
+        if (
+          normalizeCursorToolName(rawName) === "askquestion"
+          && asRecord(result)?.rejected !== undefined
+        ) {
+          return [{
+            type: "transcript",
+            entry: timestamped({
+              kind: "tool_result",
+              toolId: callId,
+              content: { discarded: true, answers: {} },
+              isError: false,
+            }),
+          }]
+        }
         // Only flag an error when Cursor explicitly reports one. A missing/non-object
         // result (e.g. a bare string) is treated as success rather than a false error.
         const resultRecord = asRecord(result)

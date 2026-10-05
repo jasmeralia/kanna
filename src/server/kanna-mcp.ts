@@ -1,9 +1,12 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
-import { kannaToolSpecs, type KannaToolHost } from "./kanna-tools"
+import { kannaToolSpecs, KANNA_TOOLS, type KannaToolDefinition, type KannaToolHost } from "./kanna-tools"
 
-export function createKannaMcpServer(host: KannaToolHost) {
+export function createKannaMcpServer(
+  host: KannaToolHost,
+  definitions: readonly KannaToolDefinition[] = KANNA_TOOLS,
+) {
   const token = crypto.randomUUID()
   const abortController = new AbortController()
   const connections = new Set<Server>()
@@ -19,11 +22,14 @@ export function createKannaMcpServer(host: KannaToolHost) {
       const mcp = new Server({ name: "kanna", version: "1.0.0" }, { capabilities: { tools: {} } })
       const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined })
       connections.add(mcp)
-      mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: kannaToolSpecs() }))
+      mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: kannaToolSpecs(definitions) }))
       mcp.setRequestHandler(CallToolRequestSchema, async (call, extra) => {
         const signal = AbortSignal.any([extra.signal, request.signal, abortController.signal])
         const progressToken = extra._meta?.progressToken
         let progress = 0
+        // Cursor sends no progressToken and does not reset its call timeout on progress,
+        // so this heartbeat does nothing on the Cursor path. Its 60 s limit is why the
+        // Cursor ask tool parks questions before the timeout.
         const heartbeat = progressToken === undefined ? undefined : setInterval(() => {
           void extra.sendNotification({
             method: "notifications/progress",

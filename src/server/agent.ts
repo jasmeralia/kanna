@@ -13,7 +13,6 @@ import {
 import { homedir } from "node:os"
 import type {
   AgentProvider,
-  AskUserQuestionItem,
   ChatAttachment,
   ChatSkillsSnapshot,
   CodexReasoningEffort,
@@ -30,7 +29,9 @@ import type {
 import { normalizeToolCall } from "../shared/tools"
 import type { ClientCommand } from "../shared/protocol"
 import { AsyncQueue } from "./async-queue"
-import { KannaToolRuntime, KannaToolEventFilter, type KannaToolHost } from "./kanna-tools"
+import { KannaToolRuntime, KannaToolEventFilter, ALL_KANNA_TOOLS, type KannaToolDefinition, type KannaToolHost } from "./kanna-tools"
+import { CURSOR_ASK_USER_QUESTION_SYSTEM_MESSAGE, formatQuestionAnswersFollowUp } from "./kanna-ask-tools"
+export { formatQuestionAnswersFollowUp } from "./kanna-ask-tools"
 import { createClaudeKannaTools } from "./kanna-tool-adapters"
 import { EventStore } from "./event-store"
 import { STRUCTURED_RESULT_TOOL_KINDS } from "./events"
@@ -144,6 +145,7 @@ interface PendingToolRequest {
   resolve: (result: unknown) => void
   resultOwner?: "tool"
   validateResult?: (result: unknown) => void
+  parked?: boolean
 }
 
 function normalizePreviewText(text: string) {
@@ -189,6 +191,8 @@ interface ActiveTurn {
   hasFinalResult: boolean
   cancelRequested: boolean
   cancelRecorded: boolean
+  parkedSettled: Promise<void> | null
+  heldResult: TranscriptEntry | null
 }
 
 interface ClaudeSessionHandle {
@@ -280,6 +284,7 @@ interface AgentCoordinatorArgs {
     provider: AgentProvider,
     query: { cwd: string; sessionToken: string | null | undefined }
   ) => SessionArtifactStatus
+  kannaToolDefinitions?: readonly KannaToolDefinition[]
 }
 
 
@@ -401,21 +406,6 @@ export function buildPromptText(content: string, attachments: ChatAttachment[]) 
     trimmed || "Please inspect the attached files.",
     attachmentHint,
   ].join("\n\n").trim()
-}
-
-/**
- * The user's answers to an AskUserQuestion, as the prompt of a follow-up
- * turn for harnesses that cannot take the answer mid-turn. Answers are keyed
- * by question id when the question has one, else by its text.
- */
-export function formatQuestionAnswersFollowUp(questions: AskUserQuestionItem[], result: unknown) {
-  const answers = asRecord(asRecord(result)?.answers) ?? {}
-  const lines = questions.map((question) => {
-    const raw = (question.id ? answers[question.id] : undefined) ?? answers[question.question]
-    const picked = (Array.isArray(raw) ? raw : raw == null ? [] : [raw]).map(String).filter(Boolean)
-    return `- ${question.question}\n  ${picked.length > 0 ? picked.join(", ") : "(no answer)"}`
-  })
-  return `Here are my answers to your questions:\n\n${lines.join("\n")}`
 }
 
 function discardedToolResult(
@@ -1038,6 +1028,7 @@ export class AgentCoordinator {
   private readonly generateTitle: (messageContent: string, cwd: string) => Promise<GenerateChatTitleResult>
   private readonly startClaudeSessionFn: NonNullable<AgentCoordinatorArgs["startClaudeSession"]>
   private readonly checkSessionArtifactFn: NonNullable<AgentCoordinatorArgs["checkSessionArtifact"]>
+  private readonly kannaToolDefinitions: readonly KannaToolDefinition[]
   private reportBackgroundError: ((message: string) => void) | null = null
   private onClaudeRateLimit: ((info: ClaudeRateLimitInfoRaw) => void) | null = null
   private cursorModelCatalogApplied = false
@@ -1072,6 +1063,7 @@ export class AgentCoordinator {
     this.generateTitle = args.generateTitle ?? generateTitleForChatDetailed
     this.startClaudeSessionFn = args.startClaudeSession ?? startClaudeSession
     this.checkSessionArtifactFn = args.checkSessionArtifact ?? checkSessionArtifact
+    this.kannaToolDefinitions = args.kannaToolDefinitions ?? ALL_KANNA_TOOLS
   }
 
   setBackgroundErrorReporter(report: ((message: string) => void) | null) {
@@ -1822,7 +1814,8 @@ export class AgentCoordinator {
             this.emitStateChange(args.chatId)
           },
           requestInput: (request, callSignal) => this.requestToolInput(args.chatId, request, callSignal),
-        })
+          parkInput: (toolUseId) => this.parkToolInput(args.chatId, toolUseId),
+        }, this.kannaToolDefinitions)
         return active.customTools.execute(name, input, signal)
       },
     }
@@ -1895,6 +1888,7 @@ export class AgentCoordinator {
         cursorContent,
         buildKannaAttributionSystemMessage(buildKannaAgentId("cursor", args.model))
       )
+      cursorContent = appendSystemMessageBlock(cursorContent, CURSOR_ASK_USER_QUESTION_SYSTEM_MESSAGE)
       // Cursor cannot fork (see canForkChat), so a turn always resumes its own session.
       turn = await this.cursorManager.startTurn({
         cwd: project.localPath,
@@ -1977,6 +1971,8 @@ export class AgentCoordinator {
       hasFinalResult: false,
       cancelRequested: false,
       cancelRecorded: false,
+      parkedSettled: null,
+      heldResult: null,
     }
     this.activeTurns.set(args.chatId, active)
     markToolsReady()
@@ -2469,6 +2465,8 @@ export class AgentCoordinator {
       hasFinalResult: false,
       cancelRequested: false,
       cancelRecorded: false,
+      parkedSettled: null,
+      heldResult: null,
     }
     this.activeTurns.set(session.chatId, active)
     await this.store.recordTurnStarted(session.chatId, session.model)
@@ -2667,6 +2665,12 @@ export class AgentCoordinator {
         }
 
         if (!event.entry || customToolEvents.skip(event.entry)) continue
+        // A parked question outlives the Cursor process. Hold the turn's
+        // success result so it stays active and waiting_for_user.
+        if (event.entry.kind === "result" && !event.entry.isError && active.pendingTool?.parked) {
+          active.heldResult = event.entry
+          continue
+        }
         await this.store.appendMessage(active.chatId, event.entry)
         this.trackSubagentFromEntry(active.chatId, event.entry)
 
@@ -2693,6 +2697,9 @@ export class AgentCoordinator {
 
         this.emitStateChange(active.chatId)
       }
+      if (active.heldResult && active.parkedSettled && !active.cancelRequested) {
+        await active.parkedSettled
+      }
     } catch (error) {
       if (!active.cancelRequested) {
         const message = error instanceof Error ? error.message : String(error)
@@ -2709,6 +2716,7 @@ export class AgentCoordinator {
         await this.store.recordTurnFailed(active.chatId, message)
       }
     } finally {
+      await this.discardParkedTool(active)
       if (active.cancelRequested && !active.cancelRecorded) {
         await this.store.recordTurnCancelled(active.chatId)
       }
@@ -2863,6 +2871,33 @@ export class AgentCoordinator {
     active.turn.close()
   }
 
+  private parkToolInput(chatId: string, toolUseId: string): boolean {
+    const active = this.activeTurns.get(chatId)
+    const pending = active?.pendingTool
+    if (!active || active.cancelRequested || !pending || pending.toolUseId !== toolUseId) return false
+    pending.parked = true
+    // The tool call has returned, so the coordinator writes the result now.
+    pending.resultOwner = undefined
+    const resolve = pending.resolve
+    let settle!: () => void
+    active.parkedSettled = new Promise<void>((done) => { settle = done })
+    pending.resolve = (result) => { resolve(result); settle() }
+    return true
+  }
+
+  private async discardParkedTool(active: ActiveTurn) {
+    const pending = active.pendingTool
+    if (!pending?.parked) return
+    active.pendingTool = null
+    const result = discardedToolResult(pending.tool)
+    try {
+      await this.store.appendMessage(active.chatId, timestamped({ kind: "tool_result", toolId: pending.toolUseId, content: result }))
+    } catch {
+      // Best effort: cleanup below must still run.
+    }
+    pending.resolve(result)
+  }
+
   private async requestToolInput(chatId: string, request: HarnessToolRequest, signal?: AbortSignal): Promise<unknown> {
     const active = this.activeTurns.get(chatId)
     if (!active || active.cancelRequested) throw new Error("Chat turn ended")
@@ -2906,6 +2941,11 @@ export class AgentCoordinator {
     }
     pending.validateResult?.(command.result)
 
+    // Clear the request before the awaited transcript write so a concurrent
+    // second submission cannot append another result for the same question.
+    active.pendingTool = null
+    active.status = "running"
+
     if (pending.resultOwner !== "tool") {
       await this.store.appendMessage(
         command.chatId,
@@ -2916,9 +2956,6 @@ export class AgentCoordinator {
         })
       )
     }
-
-    active.pendingTool = null
-    active.status = "running"
 
     if (pending.tool.toolKind === "exit_plan_mode") {
       const result = (command.result ?? {}) as {
@@ -2948,7 +2985,10 @@ export class AgentCoordinator {
               planMode: true,
             }
       }
-    } else if (pending.tool.toolKind === "ask_user_question" && active.provider === "grok") {
+    } else if (
+      pending.tool.toolKind === "ask_user_question"
+      && (active.provider === "grok" || (active.provider === "cursor" && pending.parked))
+    ) {
       active.postToolFollowUp = {
         content: formatQuestionAnswersFollowUp(pending.tool.input.questions, command.result),
         planMode: active.planMode,
