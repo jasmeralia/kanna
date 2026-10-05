@@ -10,6 +10,8 @@ import { ORCHESTRATION_TOOLS } from "./kanna-orchestration-tools"
 import { SECRET_TOOLS } from "./kanna-secret-tools"
 import type { ChatOrchestrator } from "./orchestrator"
 import type { SecretsService } from "./secrets"
+import { ASK_USER_QUESTION_TOOL, ASK_ALREADY_PARKED_TEXT } from "./kanna-ask-tools"
+import type { AskUserQuestionItem, AskUserQuestionAnswerMap } from "../shared/types"
 
 export interface KannaToolResult {
   [key: string]: unknown
@@ -33,7 +35,12 @@ interface KannaToolContext {
   orchestration?: ChatOrchestrator
   projectId?: string
   secrets?: SecretsService
+  askUser: (questions: AskUserQuestionItem[], options: { budgetMs: number }) => Promise<AskUserOutcome>
 }
+
+export type AskUserOutcome =
+  | { kind: "answered"; answers: AskUserQuestionAnswerMap }
+  | { kind: "parked" }
 
 export interface KannaToolDefinition {
   name: string
@@ -54,14 +61,18 @@ export const KANNA_TOOL_DESCRIPTION_LIMIT = 2048
 // Add tools here. Every provider registers the same definitions and calls the same handlers.
 export const KANNA_TOOLS: readonly KannaToolDefinition[] = [...DISPLAY_TOOLS, GENERATE_IMAGES_TOOL, ...ORCHESTRATION_TOOLS, ...SECRET_TOOLS]
 
+/** KANNA_TOOLS plus tools only some providers advertise (Cursor's ask tool). */
+export const ALL_KANNA_TOOLS: readonly KannaToolDefinition[] = [...KANNA_TOOLS, ASK_USER_QUESTION_TOOL]
+const ALL_KANNA_TOOL_NAMES = ALL_KANNA_TOOLS.map((tool) => tool.name)
+
 export const KANNA_TOOL_NAMES = KANNA_TOOLS.map((tool) => tool.name)
 
 export function kannaToolName(name: string): string | undefined {
-  return KANNA_TOOL_NAMES.find((candidate) => name === candidate || name === `mcp__kanna__${candidate}`)
+  return ALL_KANNA_TOOL_NAMES.find((candidate) => name === candidate || name === `mcp__kanna__${candidate}`)
 }
 
-export function kannaToolSpecs() {
-  return KANNA_TOOLS.map(({ name, description, schema }) => ({
+export function kannaToolSpecs(definitions: readonly KannaToolDefinition[] = KANNA_TOOLS) {
+  return definitions.map(({ name, description, schema }) => ({
     name,
     description,
     inputSchema: z.toJSONSchema(schema),
@@ -82,6 +93,7 @@ const REQUEST_SECRETS_RESULT = z.strictObject({
 export class KannaToolRuntime implements KannaToolHost {
   private readonly abortController = new AbortController()
   private inputTail: Promise<unknown> = Promise.resolve()
+  private parked = false
 
   constructor(private readonly context: {
     chatId: string
@@ -92,6 +104,7 @@ export class KannaToolRuntime implements KannaToolHost {
     orchestration?: ChatOrchestrator
     projectId?: string
     secrets?: SecretsService
+    parkInput?: (toolUseId: string) => boolean
   }, private readonly definitions: readonly KannaToolDefinition[] = KANNA_TOOLS) {}
 
   abort() {
@@ -116,6 +129,7 @@ export class KannaToolRuntime implements KannaToolHost {
   private async run(definition: KannaToolDefinition, rawInput: unknown, signal: AbortSignal): Promise<KannaToolResult> {
     const toolId = `kanna-${crypto.randomUUID()}`
     let started = false
+    let deferred = false
     let result: KannaToolResult & { transcriptContent?: unknown }
     try {
       signal.throwIfAborted()
@@ -161,6 +175,55 @@ export class KannaToolRuntime implements KannaToolHost {
           const parsed = responseSchema.parse(response)
           return parsed.answers.value[0]!
         },
+        askUser: async (questions, { budgetMs }) => {
+          if (this.parked) throw new Error(ASK_ALREADY_PARKED_TEXT)
+
+          tool = normalizeToolCall({ toolName: "AskUserQuestion", toolId, input: { questions } })
+          await this.context.emit(timestamped({ kind: "tool_call", tool }))
+          started = true
+          if (tool.toolKind !== "ask_user_question") throw new Error("Tool does not support user input")
+          const responseSchema = z.object({
+            answers: z.record(z.string(), z.array(z.string())),
+            discarded: z.boolean().optional(),
+          })
+          const response = this.context.requestInput({
+            tool,
+            resultOwner: "tool",
+            validateResult: (value) => { responseSchema.parse(value) },
+          }, this.abortController.signal)
+
+          let timer: ReturnType<typeof setTimeout> | undefined
+          let abortListener: (() => void) | undefined
+          const raced = await Promise.race([
+            response.then((value) => ({ kind: "response" as const, value })),
+            new Promise<{ kind: "timeout" | "aborted" }>((resolve) => {
+              timer = setTimeout(() => resolve({ kind: "timeout" }), budgetMs)
+              abortListener = () => resolve({ kind: "aborted" })
+              signal.addEventListener("abort", abortListener, { once: true })
+              if (signal.aborted) abortListener()
+            }),
+          ]).finally(() => {
+            if (timer) clearTimeout(timer)
+            if (abortListener) signal.removeEventListener("abort", abortListener)
+          })
+
+          if (raced.kind !== "response") {
+            const parked = this.context.parkInput?.(toolId) ?? false
+            if (parked) {
+              this.parked = true
+              deferred = true
+              return { kind: "parked" }
+            }
+          }
+
+          const rawResponse = raced.kind === "response" ? raced.value : await response
+          const parsed = responseSchema.parse(rawResponse)
+          if (parsed.discarded) {
+            signal.throwIfAborted()
+            throw new Error("Question discarded")
+          }
+          return { kind: "answered", answers: parsed.answers }
+        },
       })
       signal.throwIfAborted()
     } catch (error) {
@@ -170,7 +233,7 @@ export class KannaToolRuntime implements KannaToolHost {
         ...(signal.aborted ? { structuredContent: { discarded: true } } : {}),
       }
     }
-    if (started) {
+    if (started && !deferred) {
       await this.context.emit(timestamped({
         kind: "tool_result",
         toolId,
