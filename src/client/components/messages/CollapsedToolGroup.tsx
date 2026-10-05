@@ -4,6 +4,7 @@ import { ToolCallMessage } from "./ToolCallMessage"
 import { useToolPayloadPrefetch } from "./tool-payload-context"
 import { MetaRow, MetaLabel } from "./shared"
 import { AnimatedShinyText } from "../ui/animated-shiny-text"
+import { isToolCallInProgress } from "../../lib/parseTranscript"
 import type { ProcessedToolCall } from "./types"
 import type { HydratedTranscriptMessage } from "../../../shared/types"
 
@@ -68,11 +69,10 @@ interface Props {
 export function CollapsedToolGroup({ messages, isLoading, localPath, expanded, onExpandedChange }: Props) {
   const label = useMemo(() => getToolGroupLabel(messages), [messages])
 
-  // In progress = no result entry has arrived yet. Deliberately not "has no
-  // result payload": a finished call may leave its payload on the server.
+  // In progress = no result entry has arrived and the turn has not ended.
   const anyInProgress = messages.some(msg => {
     const processed = msg as ProcessedToolCall
-    return processed.resultEntryId === undefined
+    return isToolCallInProgress(processed)
   })
 
   const showLoadingState = anyInProgress && isLoading

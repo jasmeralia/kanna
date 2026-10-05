@@ -18,6 +18,7 @@ import { StatusMessage } from "../components/messages/StatusMessage"
 import { CollapsedToolGroup } from "../components/messages/CollapsedToolGroup"
 import { CHAT_SELECTION_ZONE_ATTRIBUTE } from "./chatFocusPolicy"
 import { SPECIAL_TOOL_NAMES } from "./derived"
+import { isToolCallInProgress } from "../lib/parseTranscript"
 
 const SPECIAL_TOOL_NAME_SET = new Set<string>(SPECIAL_TOOL_NAMES)
 
@@ -377,6 +378,7 @@ function sameMessage(left: HydratedTranscriptMessage, right: HydratedTranscriptM
         && left.toolName === right.toolName
         && left.toolId === right.toolId
         && left.isError === right.isError
+        && left.abandoned === right.abandoned
         // `left.id` (compared above) pins the tool_call entry and therefore
         // `input`; `resultEntryId` pins the tool_result entry and therefore
         // `result`/`rawResult`. Both entries are immutable once written, so
@@ -714,7 +716,7 @@ export function buildResolvedTranscriptRows(
         id: getTranscriptRenderItemId(item),
         startIndex: item.startIndex,
         messages: item.messages,
-        isLoading: isLoading && item.messages.some((message) => message.kind === "tool" && message.resultEntryId === undefined),
+        isLoading: isLoading && item.messages.some((message) => message.kind === "tool" && isToolCallInProgress(message)),
         localPath,
       })
       continue
@@ -727,7 +729,7 @@ export function buildResolvedTranscriptRows(
       id: getTranscriptRenderItemId(item),
       message: item.message,
       index: item.index,
-      isLoading: item.message.kind === "tool" && item.message.resultEntryId === undefined && isLoading,
+      isLoading: item.message.kind === "tool" && isToolCallInProgress(item.message) && isLoading,
       localPath,
       isFirstSystem: renderState.isFirstSystem,
       isModelChange: renderState.isModelChange,

@@ -2272,7 +2272,8 @@ export interface HydratedToolCallBase<TKind extends string, TInput, TResult> {
   isError?: boolean
   /**
    * `_id` of the `tool_result` entry this row's result was hydrated from, or
-   * undefined while the call is still pending.
+   * undefined until the result entry arrives; an ended turn may meanwhile
+   * mark the call `abandoned` during client-side hydration.
    *
    * Transcript entries are append-only and immutable, so this plus the row's
    * own `id` (the `tool_call` entry) pins `input`/`result`/`rawResult` exactly.
@@ -2281,6 +2282,12 @@ export interface HydratedToolCallBase<TKind extends string, TInput, TResult> {
    * on every snapshot push.
    */
   resultEntryId?: string
+  /**
+   * The turn this call belonged to ended (a `result` or `interrupted` entry
+   * followed it) before its result arrived. Client-side hydration only; never
+   * on the wire.
+   */
+  abandoned?: boolean
   /**
    * The wire left this call's unbounded input fields behind; fetching the entry
    * by `id` reveals them. Absent means what is here is all there is.

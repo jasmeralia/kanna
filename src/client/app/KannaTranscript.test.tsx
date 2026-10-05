@@ -63,6 +63,12 @@ function createToolMessage(id: string, toolId = id): HydratedTranscriptMessage {
   }
 }
 
+function createAbandonedToolMessage(id: string): HydratedTranscriptMessage {
+  const message = createToolMessage(id)
+  if (message.kind !== "tool") throw new Error("unexpected message kind")
+  return { ...message, abandoned: true }
+}
+
 describe("KannaTranscript", () => {
   test("renders user attachment cards outside the user bubble", () => {
     const html = renderTranscript([
@@ -652,6 +658,47 @@ Please check the latest error first.`,
     expect(single[0]?.kind).toBe("single")
     expect(grouped[0]?.kind).toBe("tool-group")
     expect(single[0]?.id).toBe(grouped[0]?.id)
+  })
+
+  test("past-turn orphaned calls stop loading while current calls still load", () => {
+    const rows = buildResolvedTranscriptRows([
+      {
+        id: "old-prompt",
+        kind: "user_prompt",
+        content: "First turn",
+        timestamp: "2026-01-01T00:00:00.000Z",
+      },
+      createAbandonedToolMessage("old-call"),
+      { id: "interrupted", kind: "interrupted", timestamp: "2026-01-01T00:00:01.000Z" },
+      {
+        id: "new-prompt",
+        kind: "user_prompt",
+        content: "Second turn",
+        timestamp: "2026-01-01T00:00:02.000Z",
+      },
+      createToolMessage("current-call"),
+    ], {
+      isLoading: true,
+      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
+    })
+
+    const oldCall = rows.find((row) => row.kind === "single" && row.id === "old-call")
+    const currentCall = rows.find((row) => row.kind === "single" && row.id === "current-call")
+    expect(oldCall?.kind === "single" && oldCall.isLoading).toBe(false)
+    expect(currentCall?.kind === "single" && currentCall.isLoading).toBe(true)
+  })
+
+  test("a collapsed group made only of abandoned calls is not loading", () => {
+    const rows = buildResolvedTranscriptRows([
+      createAbandonedToolMessage("old-call-1"),
+      createAbandonedToolMessage("old-call-2"),
+    ], {
+      isLoading: true,
+      latestToolIds: { AskUserQuestion: null, ExitPlanMode: null, TodoWrite: null },
+    })
+    expect(rows[0]?.kind).toBe("tool-group")
+    if (rows[0]?.kind !== "tool-group") throw new Error("unexpected row kind")
+    expect(rows[0].isLoading).toBe(false)
   })
 
   test("groups collapsible tools across hidden context window updates", () => {

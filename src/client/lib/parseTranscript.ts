@@ -58,6 +58,12 @@ interface PendingToolCall {
   index: number
   childIndex?: number
   normalized: NormalizedToolCall
+  abandoned?: boolean
+}
+
+/** Whether this call is still waiting for a result in its current turn. */
+export function isToolCallInProgress(call: HydratedToolCall): boolean {
+  return call.resultEntryId === undefined && !call.abandoned
 }
 
 /**
@@ -185,6 +191,7 @@ function applyToolResult(
   hydrated.isError = entry.isError
   hydrated.resultEntryId = entry._id
   hydrated.resultTrimmed = entry.trimmed
+  delete hydrated.abandoned
 
   // A trimmed result has no body to hydrate — the expanded view fetches
   // it and hydrates there, so nothing is derived from an absent payload.
@@ -299,6 +306,26 @@ export function processTranscriptMessages(
       }
       setChild(parentIndex, undefined, message)
       continue
+    }
+
+    // A top-level result or interruption ends every still-open call from
+    // this turn, including sidechain calls. Keep the pending entries so a
+    // late result can still hydrate them, but don't copy them again at a
+    // later boundary.
+    if (entry.kind === "result" || entry.kind === "interrupted") {
+      for (const [toolId, pendingCall] of pendingToolCalls) {
+        if (pendingCall.abandoned) continue
+        const call = pendingCall.childIndex === undefined
+          ? messages[pendingCall.index] as HydratedToolCall
+          : (messages[pendingCall.index] as HydratedToolCall).children![pendingCall.childIndex]! as HydratedToolCall
+        const abandoned = { ...call, abandoned: true }
+        if (pendingCall.childIndex === undefined) {
+          messages[pendingCall.index] = abandoned
+        } else {
+          setChild(pendingCall.index, pendingCall.childIndex, abandoned)
+        }
+        pendingToolCalls.set(toolId, { ...pendingCall, abandoned: true })
+      }
     }
 
     if (entry.kind === "tool_call") {

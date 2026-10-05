@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { processTranscriptMessages } from "./parseTranscript"
+import { isToolCallInProgress, processTranscriptMessages } from "./parseTranscript"
 import { getLatestToolIds } from "../app/derived"
 import type { TranscriptEntry } from "../../shared/types"
 
@@ -541,5 +541,91 @@ describe("processTranscriptMessages incremental", () => {
     expect(next).toHaveLength(3)
     expect(next[0]).not.toBe(previous[0])
     expect(next.map((message) => message.kind === "assistant_text" ? message.text : "")).toEqual(["a", "server", "c"])
+  })
+
+  test("a turn boundary abandons unresolved calls and a late result clears that state", () => {
+    const first = [toolCall("tool-1")]
+    const previous = processTranscriptMessages(first)
+    const priorCall = previous[0]
+    const next = processTranscriptMessages(
+      [...first, entry({ kind: "interrupted" })],
+      previous,
+    )
+
+    const abandoned = next[0]
+    expect(abandoned?.kind).toBe("tool")
+    if (abandoned?.kind !== "tool") throw new Error("unexpected message")
+    expect(abandoned.abandoned).toBe(true)
+    expect(isToolCallInProgress(abandoned)).toBe(false)
+    expect(abandoned).not.toBe(priorCall)
+    expect((priorCall as Extract<typeof priorCall, { kind: "tool" }>).abandoned).toBeUndefined()
+
+    const withLateResult = processTranscriptMessages(
+      [...first, entry({ kind: "interrupted" }), entry({ kind: "tool_result", toolId: "tool-1", content: "done" })],
+      next,
+    )
+    const completed = withLateResult[0]
+    if (completed?.kind !== "tool") throw new Error("unexpected message")
+    expect(completed.resultEntryId).toBeDefined()
+    expect(completed.abandoned).toBeUndefined()
+    expect(isToolCallInProgress(completed)).toBe(false)
+  })
+
+  test("result boundaries abandon calls and open calls remain in progress", () => {
+    const open = processTranscriptMessages([toolCall("tool-open")])[0]
+    const finishedTurn = processTranscriptMessages([toolCall("tool-finished"), entry({ kind: "result", result: "done", durationMs: 1 })])
+    expect(open?.kind === "tool" && isToolCallInProgress(open)).toBe(true)
+    expect(finishedTurn[0]?.kind).toBe("tool")
+    if (finishedTurn[0]?.kind !== "tool") throw new Error("unexpected message")
+    expect(finishedTurn[0].abandoned).toBe(true)
+  })
+
+  test("hidden interruption entries abandon calls, but subagent results do not end the top-level turn", () => {
+    const interrupted = processTranscriptMessages([
+      toolCall("tool-hidden"),
+      entry({ kind: "interrupted", hidden: true }),
+    ])[0]
+    expect(interrupted?.kind === "tool" && interrupted.abandoned).toBe(true)
+
+    const agentCall = entry({
+      kind: "tool_call",
+      tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: "agent-1", input: { subagentType: "Explore" } },
+    })
+    const topLevel = toolCall("tool-top-level")
+    const messages = processTranscriptMessages([
+      agentCall,
+      topLevel,
+      entry({ kind: "result", result: "subagent finished", durationMs: 1, parentToolUseId: "agent-1" }),
+    ])
+    const topLevelCall = messages.find((message) => message.kind === "tool" && message.toolId === "tool-top-level")
+    expect(topLevelCall?.kind === "tool" && topLevelCall.abandoned).toBeUndefined()
+  })
+
+  test("does not recopy already-abandoned calls at later boundaries", () => {
+    const first = [toolCall("tool-1"), entry({ kind: "interrupted" })]
+    const previous = processTranscriptMessages(first)
+    const previousCall = previous[0]
+    const next = processTranscriptMessages([...first, entry({ kind: "result", result: "done", durationMs: 1 })], previous)
+    expect(next[0]).toBe(previousCall)
+  })
+
+  test("a top-level boundary abandons open subagent children", () => {
+    const agent = entry({
+      kind: "tool_call",
+      tool: { kind: "tool", toolKind: "subagent_task", toolName: "Agent", toolId: "agent-1", input: { subagentType: "Explore" } },
+    })
+    const child = entry({
+      kind: "tool_call",
+      parentToolUseId: "agent-1",
+      tool: { kind: "tool", toolKind: "grep", toolName: "Grep", toolId: "grep-1", input: { pattern: "x" } },
+    })
+    const messages = processTranscriptMessages([agent, child, entry({ kind: "interrupted" })])
+    const parent = messages[0]
+    if (parent?.kind !== "tool") throw new Error("unexpected parent")
+    const childMessage = parent.children?.find((message) => message.kind === "tool")
+    expect(childMessage?.kind).toBe("tool")
+    if (childMessage?.kind !== "tool") throw new Error("unexpected child")
+    expect(childMessage.abandoned).toBe(true)
+    expect(isToolCallInProgress(childMessage)).toBe(false)
   })
 })

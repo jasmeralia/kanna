@@ -68,6 +68,16 @@ test("cached trimmed attachment results render from fetched payloads", () => {
   expect(html).toContain('src="https://example.com/cat.png"')
 })
 
+test("abandoned display tools explain that interruption stopped preparation", () => {
+  const [message] = processTranscriptMessages([
+    { _id: "chart", createdAt: 0, kind: "tool_call", tool: normalizeToolCall({ toolName: "show_chart", toolId: "chart", input: { title: "Sales", type: "bar", data: [] } }) },
+    { _id: "interrupted", createdAt: 1, kind: "interrupted" },
+  ])
+  if (message?.kind !== "tool") throw new Error("Expected chart tool")
+  expect(message.abandoned).toBe(true)
+  expect(renderToStaticMarkup(<DisplayToolMessage message={message} />)).toContain("Interrupted before it finished.")
+})
+
 test("chart aliases filter category columns and CSV escapes quotes", () => {
   const chart: ChartToolPayload = { title: "Sales", type: "line", data: [{ month: "Jan", value: 10 }], xAxisKey: "month", dataKeys: ["month", "value"] }
   expect(resolveChartKeys(chart)).toEqual({ xKey: "month", keys: ["value"] })
