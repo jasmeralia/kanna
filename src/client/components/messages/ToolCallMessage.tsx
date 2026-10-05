@@ -13,6 +13,7 @@ import { DisplayToolMessage } from "./DisplayToolMessage"
 import { useToolPayloadPrefetch } from "./tool-payload-context"
 import { formatToolDuration, toolCallDurationMs } from "./tool-duration"
 import { useNow } from "../chat-ui/widgets/TasksWidget"
+import { isToolCallInProgress } from "../../lib/parseTranscript"
 
 interface Props {
   message: ProcessedToolCall
@@ -95,8 +96,7 @@ export function ToolCallMessage({ message, isLoading = false, localPath }: Props
   // Presence is the *existence* of a result entry, not its payload: a result
   // may arrive with its body left on the server, to be fetched only if the row
   // is opened.
-  const hasResult = message.resultEntryId !== undefined
-  const showLoadingState = !hasResult && isLoading
+  const showLoadingState = isToolCallInProgress(message) && isLoading
 
   const name = useMemo(() => formatToolCallTitle(message, localPath), [message, localPath])
 
