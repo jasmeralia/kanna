@@ -153,7 +153,7 @@ describe("buildTerminalCommand", () => {
       .toEqual({ command: "alacritty", args: ["--working-directory", "C:\\repo"] })
   })
 
-  test("defaults to Terminal.app on macOS when no emulator is named", () => {
+  test.skipIf(process.platform !== "darwin")("defaults to Terminal.app on macOS when no emulator is named", () => {
     // The behaviour the menu had before terminals were detected at all.
     expect(buildTerminalCommand({ localPath: "/repo", platform: "darwin" }))
       .toEqual({ command: "open", args: ["-a", "Terminal", "/repo"] })
