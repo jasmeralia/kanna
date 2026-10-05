@@ -8,7 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import type { TranscriptEntry } from "../shared/types"
-import { KannaToolRuntime, KannaToolEventFilter, KANNA_TOOL_NAMES, kannaToolSpecs, type KannaToolDefinition } from "./kanna-tools"
+import { KannaToolRuntime, KannaToolEventFilter, KANNA_TOOL_NAMES, ALL_KANNA_TOOLS, kannaToolName, kannaToolSpecs, type KannaToolDefinition } from "./kanna-tools"
 import { createClaudeKannaTools, createPiKannaTools } from "./kanna-tool-adapters"
 import { createKannaMcpServer } from "./kanna-mcp"
 import { parseTranscriptMediaUrl, getTranscriptMediaDir, retargetEntryMediaUrls } from "./transcript-media"
@@ -74,6 +74,12 @@ describe("shared Kanna display tools", () => {
     expect(await runtime.execute("show_chart", {})).toMatchObject({ isError: true })
     expect(await runtime.execute("tool_test_smiley", {})).toMatchObject({ isError: true })
     expect(await runtime.execute("tool_test_input", {})).toMatchObject({ isError: true })
+  })
+  test("advertises the ask tool only when a provider explicitly requests all tools", () => {
+    expect(KANNA_TOOL_NAMES).not.toContain("ask_user_question")
+    expect(kannaToolSpecs().map((tool) => tool.name)).not.toContain("ask_user_question")
+    expect(kannaToolSpecs(ALL_KANNA_TOOLS).map((tool) => tool.name)).toContain("ask_user_question")
+    expect(kannaToolName("ask_user_question")).toBe("ask_user_question")
   })
   test("rejects ambiguous, empty, and invalid visualization inputs", async () => {
     const { runtime } = setup()
@@ -165,6 +171,8 @@ describe("shared Kanna display tools", () => {
     expect(filter.skip({ kind: "tool_call", tool: { toolName: "mcp__kanna__show_visualization", toolId: "native-1" } } as TranscriptEntry)).toBe(true)
     expect(filter.skip({ kind: "tool_result", toolId: "native-1" } as TranscriptEntry)).toBe(true)
     expect(filter.skip({ kind: "tool_result", toolId: "other" } as TranscriptEntry)).toBe(false)
+    expect(filter.skip({ kind: "tool_call", tool: { toolName: "ask_user_question", toolId: "ask-1" } } as TranscriptEntry)).toBe(true)
+    expect(filter.skip({ kind: "tool_result", toolId: "ask-1" } as TranscriptEntry)).toBe(true)
   })
   test("Claude exposes and executes both tools through MCP", async () => {
     const { runtime } = setup()
@@ -278,5 +286,17 @@ describe("shared Kanna display tools", () => {
       expect(first.entries).toHaveLength(2)
       expect(second.entries).toHaveLength(0)
     } finally { await client.close(); for (const server of servers) server.close() }
+  })
+  test("HTTP MCP accepts a provider-specific tool list", async () => {
+    const { runtime } = setup()
+    const server = createKannaMcpServer(runtime, ALL_KANNA_TOOLS)
+    const client = new Client({ name: "test", version: "1" })
+    try {
+      await client.connect(new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers: server.headers } }))
+      expect((await client.listTools()).tools.map((tool) => tool.name)).toContain("ask_user_question")
+    } finally {
+      await client.close()
+      server.close()
+    }
   })
 })
