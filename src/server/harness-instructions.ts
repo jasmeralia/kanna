@@ -70,6 +70,12 @@ export const KANNA_VISUALIZATION_INSTRUCTIONS = [
   KANNA_VISUALIZATION_CONTRACT,
 ].join("\n")
 
+const USER_QUESTION_INSTRUCTIONS = [
+  "When a missing detail or decision blocks meaningful progress on the user's request, ask it with the AskUserQuestion tool so the user can answer through Kanna's structured question UI.",
+  "Wait for the tool result before doing work that depends on the answer. Ask concise questions and include clear options when they help; leave room for a custom answer when appropriate.",
+  "Use this flow in normal mode as well as plan mode. Keep optional, non-blocking questions in ordinary conversation, and answer the user's questions directly without invoking AskUserQuestion.",
+].join(" ")
+
 /**
  * Everything Kanna tells a harness that holds for the whole session. It goes
  * in the system prompt where the provider has an append hook (claude, pi,
@@ -88,6 +94,7 @@ export function buildKannaSystemInstructions(agentId: string, options?: KannaIns
   return [
     buildKannaAttributionInstructions(agentId),
     KANNA_CHAT_LINK_INSTRUCTIONS,
+    USER_QUESTION_INSTRUCTIONS,
     ...(tools ? [KANNA_ORCHESTRATION_INSTRUCTIONS] : []),
     ...(tools && options?.delegator ? [KANNA_DELEGATOR_INSTRUCTIONS] : []),
     ...(tools ? [KANNA_VISUALIZATION_INSTRUCTIONS] : []),
